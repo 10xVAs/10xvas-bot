@@ -1010,6 +1010,52 @@ async function getDashboardData() {
 app.get('/', (req, res) => res.json({ status:'ok', bot:'10X VAs v2.0', time: new Date().toISOString() }));
 
 // ============================================================
+// SEED CUTOFF — GET /seed-cutoff (run once)
+// ============================================================
+app.get('/seed-cutoff', async (req, res) => {
+  try {
+    const now = new Date();
+    const seed = [
+      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 32.0, 6.0,  fmtTime(now)],
+      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 32.0, 7.0,  fmtTime(now)],
+      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 32.0, 3.5,  fmtTime(now)],
+      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 32.0, 2.0,  fmtTime(now)],
+      ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['1802251672','Lovely', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['8393347347','Mary',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['5359971666','Pam',    'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['6012486581','Cris',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['5660256653','Jude',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['7207758648','Noreen', 'VA',    'May 2, 2026','May 16, 2026', 24.0, 0,    fmtTime(now)],
+      ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 24.0, 0,    fmtTime(now)],
+      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
+      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
+    ];
+
+    // Clear existing data first
+    const token = await getGoogleToken();
+    if (token) {
+      await axios.put(
+        \`https://sheets.googleapis.com/v4/spreadsheets/\${SHEET_ID}/values/\${encodeURIComponent("'Cutoff Counter'!A2:H100")}\`,
+        { values: Array(99).fill(Array(8).fill('')) },
+        { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: \`Bearer \${token}\` } }
+      );
+    }
+
+    // Write seed data
+    await sheetsAppend("'Cutoff Counter'!A:H", seed);
+    res.json({ ok: true, seeded: seed.length });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ============================================================
 // START
 // ============================================================
 app.listen(PORT, async () => {

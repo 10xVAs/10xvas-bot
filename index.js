@@ -202,16 +202,18 @@ async function getGoogleToken() {
 }
 
 async function sheetsAppend(range, values) {
-  if (!SHEET_ID) return;
+  if (!SHEET_ID || !GOOGLE_SA) return;
   try {
     const token = await getGoogleToken();
-    if (!token) return;
+    if (!token) { console.error('sheetsAppend: no token'); return; }
     await axios.post(
       `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}:append`,
       { values },
       { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: `Bearer ${token}` } }
     );
-  } catch(e) { console.error('sheetsAppend:', e.message); }
+  } catch(e) {
+    console.error('sheetsAppend error:', range, e.response?.data || e.message);
+  }
 }
 
 async function sheetsGet(range) {
@@ -250,7 +252,7 @@ async function sheetsUpdate(range, values) {
 // ============================================================
 async function logAction(uid, name, action, now) {
   try {
-    await sheetsAppend('Telegram Logs!A:E', [[
+    await sheetsAppend("'Telegram Logs'!A:E", [[
       fmtDate(now), fmtTime(now), action, name, uid
     ]]);
   } catch(e) { console.error('logAction:', e.message); }
@@ -381,7 +383,7 @@ async function updateLeaderShiftRow(uid, endTime) {
 // CUTOFF COUNTER
 // ============================================================
 async function getCutoffHours(uid) {
-  const data = await sheetsGet('Cutoff Counter!A:H');
+  const data = await sheetsGet("'Cutoff Counter'!A:H");
   for (let i = 1; i < data.length; i++) {
     if (String(data[i][0]) === uid) {
       return { hours: parseFloat(data[i][5]) || 0, ot: parseFloat(data[i][6]) || 0, row: i + 1 };
@@ -408,7 +410,7 @@ async function addCutoffHours(uid, name, role, addHours, addOT) {
         fmtTime(now),
       ]]);
     } else {
-      await sheetsAppend('Cutoff Counter!A:H', [[
+      await sheetsAppend("'Cutoff Counter'!A:H", [[
         uid, name, role,
         fmtDate(co.start), fmtDate(co.end),
         Math.round(addHours * 100) / 100,
@@ -1228,7 +1230,7 @@ app.get('/seed-cutoff', async (req, res) => {
     }
 
     // Write seed data to sheet
-    await sheetsAppend('Cutoff Counter!A:H', seed);
+    await sheetsAppend("'Cutoff Counter'!A:H", seed);
 
     // Also populate in-memory CUTOFF
     for (const r of seed) {

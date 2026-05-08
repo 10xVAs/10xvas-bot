@@ -431,9 +431,8 @@ function calcPayable(uid, state, logoutTime) {
   if (!isLeader) hours = Math.min(hours, MAX_HRS);
 
   let ot = 0;
-  const role = ROSTER[uid]?.role || 'VA';
-  if (role === 'Leader' && login < win.start) {
-    // OT = full 30-min blocks before shift start only
+  const userRole = ROSTER[uid]?.role || 'VA';
+  if (userRole === 'Leader' && login < win.start) {
     const preShiftMs = win.start.getTime() - login.getTime();
     ot = Math.floor(preShiftMs / (30 * 60000)) * 0.5;
   }

@@ -458,18 +458,16 @@ async function handleIn(uid, name) {
   const minsToShift = minsBetween(now, win.start);
   const minsLate    = minsBetween(win.start, now);
 
-  // Very early login (30+ mins before shift)
-  if (minsToShift > EARLY_LIMIT) {
-    return `🌅 Hi ${name}! You're early today — your shift starts at ${fmtTime(win.start)}. Feel free to log in again closer to your start time!`;
-  }
-
-  // Determine late status
-  const isLate = minsLate > GRACE_MINS;
+  // Determine status
+  const isLate        = minsLate > GRACE_MINS;
+  const isVeryEarly   = minsToShift > EARLY_LIMIT;  // more than 30 mins early
+  const isSlightEarly = minsToShift > 0 && minsToShift <= EARLY_LIMIT; // within 30 mins early
 
   setState(uid, {
-    status:      'in',
+    status:      (isVeryEarly || isSlightEarly) ? 'pre-shift' : 'in',
     loginTime:   now.toISOString(),
     shiftDate:   dateStr,
+    shiftStart:  win.start.toISOString(),
     breakUsed:   0,
     bblUsed:     false,
     lunchUsed:   false,
@@ -482,11 +480,16 @@ async function handleIn(uid, name) {
     lateMs:      isLate ? minsLate * 60000 : 0,
   });
 
-  // Log to User Logs
   addUserLogRow(uid, 'Shift', now).catch(console.error);
 
-  if (minsToShift > 0 && minsToShift <= EARLY_LIMIT) {
-    return `✅ Log In confirmed — ${name}. Your shift starts at ${fmtTime(win.start)} Manila. You're a bit early, hang tight!`;
+  // Very early (30+ mins before shift) — accepted but show shift time
+  if (isVeryEarly) {
+    return `🌅 Log In confirmed — ${name}. You're early today! Your shift starts at ${fmtTime(win.start)} Manila. We'll mark you active then. 💪`;
+  }
+
+  // Slightly early (within 30 mins) — regular login message
+  if (isSlightEarly) {
+    return `✅ Log In confirmed — ${name}. Your shift for today starts at ${fmtTime(win.start)} Manila. Have a great shift! 💪`;
   }
 
   if (isLate) {
@@ -499,6 +502,15 @@ async function handleIn(uid, name) {
 async function handleOut(uid, name) {
   const state = getState(uid);
   const now   = new Date();
+
+  // Auto-promote pre-shift to in if shift has started
+  if (state.status === 'pre-shift' && state.shiftStart) {
+    const shiftStart = new Date(state.shiftStart);
+    if (new Date() >= shiftStart) {
+      state.status = 'in';
+      setState(uid, state);
+    }
+  }
 
   if (state.status === 'out') {
     return `⚠️ ${name}, you're not currently logged in. If this is an error, please contact your manager.`;
@@ -544,6 +556,12 @@ async function handleBreak(uid, name, breakType) {
   const state = getState(uid);
   const now   = new Date();
 
+  // Auto-promote pre-shift if shift started
+  if (state.status === 'pre-shift' && state.shiftStart && new Date() >= new Date(state.shiftStart)) {
+    state.status = 'in';
+    setState(uid, state);
+  }
+
   if (state.status === 'out') {
     return `⚠️ ${name}, you need to log in first before taking a break!`;
   }
@@ -582,6 +600,12 @@ async function handleBreak(uid, name, breakType) {
 async function handleBack(uid, name) {
   const state = getState(uid);
   const now   = new Date();
+
+  // Auto-promote pre-shift if shift started
+  if (state.status === 'pre-shift' && state.shiftStart && new Date() >= new Date(state.shiftStart)) {
+    state.status = 'in';
+    setState(uid, state);
+  }
 
   if (state.status === 'out') {
     return `⚠️ ${name}, you're not currently logged in.`;
@@ -937,6 +961,16 @@ async function getDashboardData() {
       if (state.status === 'out') {
         status = (now >= win.start && now <= win.end) ? 'missing' : 'offline';
         label  = status === 'missing' ? 'Missing' : 'Offline';
+      } else if (state.status === 'pre-shift') {
+        // Auto-promote if shift has started
+        if (state.shiftStart && now >= new Date(state.shiftStart)) {
+          state.status = 'in';
+          setState(uid, state);
+          status = 'active'; label = 'Active';
+        } else {
+          status = 'pre-shift'; label = 'Pre-Shift';
+        }
+        if (state.loginTime) elapsed = minsBetween(new Date(state.loginTime), now) + 'm';
       } else if (state.status === 'in') {
         const isOverbreak = (state.overbreakMs||0) > 0 || (state.overlunchMs||0) > 0;
         status = state.isLate ? 'late' : (isOverbreak ? 'overbreak' : 'active');
@@ -978,11 +1012,12 @@ async function getDashboardData() {
     lunch:     5,
     bbl:       6,
     active:    7,
-    holiday:   8,
-    leave:     9,
-    vto:       10,
-    offset:    11,
-    offline:   12,
+    'pre-shift': 8,
+    holiday:   9,
+    leave:     10,
+    vto:       11,
+    offset:    12,
+    offline:   13,
   };
   const roleOrder = { Leader:0, UYP:1, VA:2 };
 
@@ -1005,6 +1040,87 @@ async function getDashboardData() {
 }
 
 // ============================================================
+// SET STATES — GET /set-states (run once to set everyone as logged in)
+// ============================================================
+app.get('/set-states', (req, res) => {
+  try {
+    const manila = manilaTime();
+    const dateStr = getManilaDateStr(manila);
+
+    // Define login times per user (Manila time)
+    const logins = [
+      // 12:00 AM shift — logged in at 11:45 PM May 8
+      { uid:'8044736892', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7240390530', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7830367843', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'2018117745', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7207758648', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'8070441816', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7514392042', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'5685031197', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'6132223983', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'6088627916', loginHour:23, loginMin:45, prevDay:true },
+      // Cha - 12 AM shift, Mon-Thu (today is Fri so day off - skip)
+      // Alexis - 12 AM shift, Wed-Sun (works today Fri)
+      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
+      // 8:00 PM shift — Queency
+      { uid:'2009869833', loginHour:20, loginMin:0,  prevDay:true },
+      // 9:00 PM shifts
+      { uid:'7831137596', loginHour:21, loginMin:0,  prevDay:true },
+      { uid:'1802251672', loginHour:21, loginMin:0,  prevDay:true },
+      { uid:'8393347347', loginHour:21, loginMin:0,  prevDay:true },
+      { uid:'5359971666', loginHour:21, loginMin:0,  prevDay:true },
+      { uid:'6012486581', loginHour:21, loginMin:0,  prevDay:true },
+      { uid:'5660256653', loginHour:21, loginMin:0,  prevDay:true },
+    ];
+
+    const now = new Date();
+    // Get yesterday's date string
+    const yesterday = new Date(now.getTime() - 86400000);
+    const yDateStr = getManilaDateStr(yesterday);
+
+    let count = 0;
+    const set = new Set();
+
+    for (const u of logins) {
+      if (set.has(u.uid)) continue; // skip duplicates
+      set.add(u.uid);
+
+      const entry = ROSTER[u.uid];
+      if (!entry) continue;
+
+      const shiftDateStr = u.prevDay ? yDateStr : dateStr;
+      const loginDateStr = u.prevDay ? yDateStr : dateStr;
+      const loginTime = new Date(`${loginDateStr}T${String(u.loginHour).padStart(2,'0')}:${String(u.loginMin).padStart(2,'0')}:00+08:00`);
+      const win = getShiftWindow(entry, shiftDateStr);
+
+      setState(u.uid, {
+        status:      'in',
+        loginTime:   loginTime.toISOString(),
+        shiftDate:   shiftDateStr,
+        shiftStart:  win.start.toISOString(),
+        breakUsed:   0,
+        bblUsed:     false,
+        lunchUsed:   false,
+        lunchUsedMs: 0,
+        overbreakMs: 0,
+        overlunchMs: 0,
+        breakStart:  null,
+        breakType:   null,
+        isLate:      false,
+        lateMs:      0,
+      });
+      count++;
+    }
+
+    res.json({ ok:true, statesSet: count });
+  } catch(e) {
+    res.json({ ok:false, error: e.message });
+  }
+});
+
+// ============================================================
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => res.json({ status:'ok', bot:'10X VAs v2.0', time: new Date().toISOString() }));
@@ -1016,25 +1132,29 @@ app.get('/seed-cutoff', async (req, res) => {
   try {
     const now = new Date();
     const seed = [
-      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 32.0, 6.0,  fmtTime(now)],
-      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 32.0, 7.0,  fmtTime(now)],
-      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 32.0, 3.5,  fmtTime(now)],
-      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 32.0, 2.0,  fmtTime(now)],
-      ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['1802251672','Lovely', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['8393347347','Mary',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['5359971666','Pam',    'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['6012486581','Cris',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['5660256653','Jude',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['7207758648','Noreen', 'VA',    'May 2, 2026','May 16, 2026', 24.0, 0,    fmtTime(now)],
-      ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 24.0, 0,    fmtTime(now)],
-      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
-      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
+      // 5 shifts completed as of May 9
+      // Leaders: 40h base + cumulative OT (Bert:6, Moon:7, Nell:3.5, Gab:2)
+      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 40.0, 6.0,  fmtTime(now)],
+      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 40.0, 7.0,  fmtTime(now)],
+      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 40.0, 3.5,  fmtTime(now)],
+      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 40.0, 2.0,  fmtTime(now)],
+      // VAs: 5 shifts x 8h = 40h (Noreen had 1 absent = 32h)
+      ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['1802251672','Lovely', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['8393347347','Mary',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['5359971666','Pam',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['6012486581','Cris',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['5660256653','Jude',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7207758648','Noreen', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      // UYP: 5 shifts x 8h = 40h (Kat had 1 absent = 32h)
+      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
+      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
+      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
     ];
 
     // Clear existing data first

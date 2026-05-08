@@ -24,7 +24,8 @@ const EARLY_LIMIT = 30; // mins before shift = early warning
 const BBL_MINS    = 90;
 const LUNCH_MINS  = 60;
 const MAX_HRS     = 8;
-const TARGET_HRS  = 80; // cutoff target for VA/UYP
+const TARGET_HRS    = 80;  // cutoff target for VA/UYP
+const LEADER_MAX_HRS = 90;  // max payable hours per cutoff for Leaders
 const CUTOFF_START_VA_MS = new Date('2026-05-02T09:00:00+08:00').getTime();
 const CUTOFF_DAYS = 14;
 
@@ -251,11 +252,23 @@ async function sheetsUpdate(range, values) {
 // TELEGRAM LOG — simple append to Telegram Logs sheet
 // ============================================================
 async function logAction(uid, name, action, now) {
+  console.log(`logAction called: ${action} by ${name} (${uid})`);
+  console.log(`SHEET_ID: ${SHEET_ID ? 'set' : 'NOT SET'}, GOOGLE_SA: ${GOOGLE_SA ? 'set' : 'NOT SET'}`);
   try {
-    await sheetsAppend("'Telegram Logs'!A:E", [[
-      fmtDate(now), fmtTime(now), action, name, uid
-    ]]);
-  } catch(e) { console.error('logAction:', e.message); }
+    const token = await getGoogleToken();
+    console.log(`Token: ${token ? 'obtained' : 'FAILED'}`);
+    if (!token) return;
+    const range = encodeURIComponent("'Telegram Logs'!A:E");
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}:append`;
+    console.log(`Calling sheets API: ${url.substring(0, 80)}`);
+    const res = await axios.post(url,
+      { values: [[fmtDate(now), fmtTime(now), action, name, uid]] },
+      { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: `Bearer ${token}` } }
+    );
+    console.log(`Sheets append success: ${res.status}`);
+  } catch(e) {
+    console.error('logAction error:', e.response?.data || e.message);
+  }
 }
 
 // ============================================================
@@ -395,8 +408,22 @@ async function getCutoffHours(uid) {
 async function addCutoffHours(uid, name, role, addHours, addOT) {
   // Update in-memory first (instant, no sheet dependency)
   if (!CUTOFF[uid]) CUTOFF[uid] = { hours: 0, ot: 0 };
-  CUTOFF[uid].hours = Math.round((CUTOFF[uid].hours + addHours) * 100) / 100;
-  CUTOFF[uid].ot    = Math.round((CUTOFF[uid].ot + (addOT||0)) * 100) / 100;
+  const newHours = Math.round((CUTOFF[uid].hours + addHours) * 100) / 100;
+  const newOT    = Math.round((CUTOFF[uid].ot + (addOT||0)) * 100) / 100;
+  // Apply 90h cap for Leaders
+  if (role === 'Leader') {
+    const combined = newHours + newOT;
+    if (combined > LEADER_MAX_HRS) {
+      CUTOFF[uid].hours = Math.min(newHours, LEADER_MAX_HRS);
+      CUTOFF[uid].ot    = Math.max(0, LEADER_MAX_HRS - CUTOFF[uid].hours);
+    } else {
+      CUTOFF[uid].hours = newHours;
+      CUTOFF[uid].ot    = newOT;
+    }
+  } else {
+    CUTOFF[uid].hours = newHours;
+    CUTOFF[uid].ot    = newOT;
+  }
 
   try {
     const current = await getCutoffHours(uid);
@@ -1023,7 +1050,8 @@ async function getDashboardData() {
       id: uid, name: entry.name, role: entry.role,
       status, statusLabel: label,
       shiftStart, shiftEnd, elapsed, shiftProgress,
-      runningHours: co.hours, otHours: co.ot,
+      runningHours: entry.role === 'Leader' ? Math.min(co.hours, LEADER_MAX_HRS) : co.hours,
+      otHours: entry.role === 'Leader' ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - co.hours)) : co.ot,
       loginTime: state.loginTime ? fmtTime(new Date(state.loginTime)) : '',
       breakUsed: state.breakUsed || 0, bblUsed: state.bblUsed || false,
       cutoffEnd: fmtDate(coDates.end),
@@ -1196,10 +1224,10 @@ app.get('/seed-cutoff', async (req, res) => {
     const seed = [
       // 5 shifts completed as of May 9
       // Leaders: 40h base + cumulative OT (Bert:6, Moon:7, Nell:3.5, Gab:2)
-      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 40.0, 6.0,  fmtTime(now)],
-      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 40.0, 7.0,  fmtTime(now)],
-      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 40.0, 3.5,  fmtTime(now)],
-      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 40.0, 2.0,  fmtTime(now)],
+      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
+      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
+      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 40.0,  6.5, fmtTime(now)],
+      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 40.0,  3.0, fmtTime(now)],
       // VAs: 5 shifts x 8h = 40h (Noreen had 1 absent = 32h)
       ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
       ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],

@@ -431,8 +431,11 @@ function calcPayable(uid, state, logoutTime) {
   if (!isLeader) hours = Math.min(hours, MAX_HRS);
 
   let ot = 0;
-  if (isLeader && login < win.start) {
-    ot = Math.floor((win.start.getTime() - login.getTime()) / (30*60000)) * 0.5;
+  const role = ROSTER[uid]?.role || 'VA';
+  if (role === 'Leader' && login < win.start) {
+    // OT = full 30-min blocks before shift start only
+    const preShiftMs = win.start.getTime() - login.getTime();
+    ot = Math.floor(preShiftMs / (30 * 60000)) * 0.5;
   }
 
   return {
@@ -1176,7 +1179,7 @@ app.get('/seed-cutoff', async (req, res) => {
 
     // Also populate in-memory CUTOFF
     for (const r of seed) {
-      CUTOFF[r[0]] = { hours: parseFloat(r[6]) || 0, ot: parseFloat(r[7]) || 0 };
+      CUTOFF[r[0]] = { hours: parseFloat(r[5]) || 0, ot: parseFloat(r[6]) || 0 };
     }
 
     res.json({ ok: true, seeded: seed.length });

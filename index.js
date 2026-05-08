@@ -934,7 +934,12 @@ async function getDashboardData() {
 
   for (const [uid, entry] of Object.entries(ROSTER)) {
     const state = getState(uid);
-    const sched = getSchedule(uid, manila);
+    // If user is logged in, use their shiftDate for schedule lookup (handles overnight shifts)
+    let schedManila = manila;
+    if (state.shiftDate) {
+      schedManila = new Date(new Date(state.shiftDate + 'T12:00:00+08:00').toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
+    }
+    const sched = getSchedule(uid, schedManila) || getSchedule(uid, manila);
     const co    = cutoffMap[uid] || { hours:0, ot:0 };
 
     let status = 'offline', label = 'Offline';

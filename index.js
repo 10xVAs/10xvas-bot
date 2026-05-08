@@ -215,7 +215,7 @@ async function sheetsAppend(range, values) {
 }
 
 async function sheetsGet(range) {
-  if (!SHEET_ID) return [];
+  if (!SHEET_ID || !GOOGLE_SA) return [];
   try {
     const token = await getGoogleToken();
     if (!token) return [];
@@ -224,7 +224,12 @@ async function sheetsGet(range) {
       { headers: { Authorization: `Bearer ${token}` } }
     );
     return res.data.values || [];
-  } catch(e) { console.error('sheetsGet:', e.message); return []; }
+  } catch(e) {
+    if (!e.message.includes('400') && !e.message.includes('404')) {
+      console.error('sheetsGet:', e.message);
+    }
+    return [];
+  }
 }
 
 async function sheetsUpdate(range, values) {
@@ -241,6 +246,17 @@ async function sheetsUpdate(range, values) {
 }
 
 // ============================================================
+// TELEGRAM LOG — simple append to Telegram Logs sheet
+// ============================================================
+async function logAction(uid, name, action, now) {
+  try {
+    await sheetsAppend('Telegram Logs!A:E', [[
+      fmtDate(now), fmtTime(now), action, name, uid
+    ]]);
+  } catch(e) { console.error('logAction:', e.message); }
+}
+
+// ============================================================
 // USER LOGS — column-per-user format
 // Col layout per user: Activity | Start | End | Duration (4 cols)
 // Row 1: User names (merged)
@@ -254,9 +270,13 @@ const COLS_PER_USER = 4;
 let userLogsHeaders = null; // cached row 1
 
 async function initUserLogMap() {
+  if (!SHEET_ID || !GOOGLE_SA) return;
   try {
     const row1 = await sheetsGet("'User Logs'!1:1");
-    if (!row1 || !row1[0]) return;
+    if (!row1 || !row1[0]) {
+      console.log('User Logs sheet not found or empty — skipping column map');
+      return;
+    }
     userLogsHeaders = row1[0];
     for (let i = 0; i < userLogsHeaders.length; i += COLS_PER_USER) {
       const name = userLogsHeaders[i];
@@ -264,6 +284,7 @@ async function initUserLogMap() {
       const uid = Object.keys(ROSTER).find(k => ROSTER[k].name === name);
       if (uid) USER_COL_MAP[uid] = i;
     }
+    console.log(`User Log map initialized: ${Object.keys(USER_COL_MAP).length} users`);
   } catch(e) { console.error('initUserLogMap:', e.message); }
 }
 
@@ -360,7 +381,7 @@ async function updateLeaderShiftRow(uid, endTime) {
 // CUTOFF COUNTER
 // ============================================================
 async function getCutoffHours(uid) {
-  const data = await sheetsGet("'Cutoff Counter'!A:H");
+  const data = await sheetsGet('Cutoff Counter!A:H');
   for (let i = 1; i < data.length; i++) {
     if (String(data[i][0]) === uid) {
       return { hours: parseFloat(data[i][5]) || 0, ot: parseFloat(data[i][6]) || 0, row: i + 1 };
@@ -387,7 +408,7 @@ async function addCutoffHours(uid, name, role, addHours, addOT) {
         fmtTime(now),
       ]]);
     } else {
-      await sheetsAppend("'Cutoff Counter'!A:H", [[
+      await sheetsAppend('Cutoff Counter!A:H', [[
         uid, name, role,
         fmtDate(co.start), fmtDate(co.end),
         Math.round(addHours * 100) / 100,
@@ -491,6 +512,7 @@ async function handleIn(uid, name) {
   });
 
   addUserLogRow(uid, 'Shift', now).catch(console.error);
+  logAction(uid, name, 'in', now).catch(console.error);
 
   // Very early (30+ mins before shift) — accepted but show shift time
   if (isVeryEarly) {
@@ -1127,6 +1149,38 @@ app.get('/set-states', (req, res) => {
 });
 
 // ============================================================
+// ADMIN ENDPOINTS
+// ============================================================
+
+// Reset all user states (call before each shift)
+app.get('/reset-states', (req, res) => {
+  const keys = Object.keys(STATE);
+  keys.forEach(k => delete STATE[k]);
+  console.log(`Reset ${keys.length} user states`);
+  res.json({ ok: true, cleared: keys.length });
+});
+
+// Full shift reset (states + re-register webhook)
+app.get('/shift-reset', async (req, res) => {
+  try {
+    // Clear all states
+    const keys = Object.keys(STATE);
+    keys.forEach(k => delete STATE[k]);
+
+    // Re-register webhook with drop_pending
+    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+      url: `${WEBHOOK_URL}/webhook`,
+      drop_pending_updates: true,
+    });
+
+    console.log(`Shift reset: cleared ${keys.length} states, webhook refreshed`);
+    res.json({ ok: true, cleared: keys.length, webhook: 'refreshed' });
+  } catch(e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// ============================================================
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => res.json({ status:'ok', bot:'10X VAs v2.0', time: new Date().toISOString() }));
@@ -1174,7 +1228,7 @@ app.get('/seed-cutoff', async (req, res) => {
     }
 
     // Write seed data to sheet
-    await sheetsAppend("'Cutoff Counter'!A:H", seed);
+    await sheetsAppend('Cutoff Counter!A:H', seed);
 
     // Also populate in-memory CUTOFF
     for (const r of seed) {

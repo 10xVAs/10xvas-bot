@@ -5,7 +5,6 @@
 
 const express  = require('express');
 const axios    = require('axios');
-const { GoogleSpreadsheet } = require('google-spreadsheet');
 
 const app = express();
 app.use(express.json());

@@ -59,6 +59,9 @@ const ROSTER = {
 // ============================================================
 const STATE = {};
 
+// In-memory cutoff hours — seeded via /seed-cutoff, updated on /out
+const CUTOFF = {};
+
 function getState(uid) { return STATE[uid] || { status: 'out' }; }
 function setState(uid, s) { STATE[uid] = s; }
 function clearState(uid) { delete STATE[uid]; }
@@ -367,6 +370,11 @@ async function getCutoffHours(uid) {
 }
 
 async function addCutoffHours(uid, name, role, addHours, addOT) {
+  // Update in-memory first (instant, no sheet dependency)
+  if (!CUTOFF[uid]) CUTOFF[uid] = { hours: 0, ot: 0 };
+  CUTOFF[uid].hours = Math.round((CUTOFF[uid].hours + addHours) * 100) / 100;
+  CUTOFF[uid].ot    = Math.round((CUTOFF[uid].ot + (addOT||0)) * 100) / 100;
+
   try {
     const current = await getCutoffHours(uid);
     const now     = new Date();
@@ -921,17 +929,8 @@ async function getDashboardData() {
   const manila = manilaTime();
   const users  = [];
 
-  // Load cutoff data
-  let cutoffMap = {};
-  try {
-    const data = await sheetsGet("'Cutoff Counter'!A:H");
-    for (let i = 1; i < data.length; i++) {
-      cutoffMap[String(data[i][0])] = {
-        hours: parseFloat(data[i][5]) || 0,
-        ot:    parseFloat(data[i][6]) || 0,
-      };
-    }
-  } catch(e) {}
+  // Use in-memory CUTOFF (always up to date, no sheet read needed)
+  const cutoffMap = CUTOFF;
 
   for (const [uid, entry] of Object.entries(ROSTER)) {
     const state = getState(uid);
@@ -1167,8 +1166,14 @@ app.get('/seed-cutoff', async (req, res) => {
       );
     }
 
-    // Write seed data
+    // Write seed data to sheet
     await sheetsAppend("'Cutoff Counter'!A:H", seed);
+
+    // Also populate in-memory CUTOFF
+    for (const r of seed) {
+      CUTOFF[r[0]] = { hours: parseFloat(r[6]) || 0, ot: parseFloat(r[7]) || 0 };
+    }
+
     res.json({ ok: true, seeded: seed.length });
   } catch(e) {
     res.json({ ok: false, error: e.message });

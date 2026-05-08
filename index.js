@@ -1041,9 +1041,9 @@ app.get('/seed-cutoff', async (req, res) => {
     const token = await getGoogleToken();
     if (token) {
       await axios.put(
-        \`https://sheets.googleapis.com/v4/spreadsheets/\${SHEET_ID}/values/\${encodeURIComponent("'Cutoff Counter'!A2:H100")}\`,
+        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent("'Cutoff Counter'!A2:H100")}`,
         { values: Array(99).fill(Array(8).fill('')) },
-        { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: \`Bearer \${token}\` } }
+        { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: `Bearer ${token}` } }
       );
     }
 

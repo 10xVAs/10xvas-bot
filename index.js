@@ -19,7 +19,7 @@ redisClient.connect().then(() => console.log("Connected to Redis! 🚀"));
 // ============================================================
 // CONFIG
 // ============================================================
-const TOKEN        = process.env.TOKEN;
+const TOKEN        = process.env.TELEGRAM_TOKEN;
 const ALLOWED_CHAT = process.env.ALLOWED_CHAT;
 const TOPIC_ID     = process.env.TOPIC_ID;
 const WEBHOOK_URL  = process.env.WEBHOOK_URL;

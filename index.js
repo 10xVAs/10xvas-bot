@@ -1,17 +1,25 @@
 // ============================================================
-// 10X VAs — Telegram Bot v2.0
+// 10X VAs — Telegram Bot v2.0 (Redis Persistent Edition)
 // Node.js + Express — Railway Deployment
 // ============================================================
 
 const express = require('express');
 const axios   = require('axios');
+const redis   = require('redis');
 const app     = express();
 app.use(express.json());
 
 // ============================================================
+// REDIS CONNECTION (Persistent Notepad)
+// ============================================================
+const redisClient = redis.createClient({ url: process.env.REDIS_URL });
+redisClient.on('error', err => console.log('Redis Error:', err));
+redisClient.connect().then(() => console.log("Connected to Redis! 🚀"));
+
+// ============================================================
 // CONFIG
 // ============================================================
-const TOKEN        = process.env.TELEGRAM_TOKEN;
+const TOKEN        = process.env.TOKEN;
 const ALLOWED_CHAT = process.env.ALLOWED_CHAT;
 const TOPIC_ID     = process.env.TOPIC_ID;
 const WEBHOOK_URL  = process.env.WEBHOOK_URL;
@@ -19,18 +27,18 @@ const SHEET_ID     = process.env.SHEET_ID;
 const GOOGLE_SA    = process.env.GOOGLE_SA ? JSON.parse(process.env.GOOGLE_SA) : null;
 const PORT         = process.env.PORT || 8080;
 
-const GRACE_MINS  = 4;
-const EARLY_LIMIT = 30; // mins before shift = early warning
-const BBL_MINS    = 90;
-const LUNCH_MINS  = 60;
-const MAX_HRS     = 8;
-const TARGET_HRS    = 80;  // cutoff target for VA/UYP
-const LEADER_MAX_HRS = 90;  // max payable hours per cutoff for Leaders
+const GRACE_MINS   = 4;
+const EARLY_LIMIT  = 30; 
+const BBL_MINS     = 90;
+const LUNCH_MINS   = 60;
+const MAX_HRS       = 8;
+const TARGET_HRS    = 80;  
+const LEADER_MAX_HRS = 90; 
 const CUTOFF_START_VA_MS = new Date('2026-05-02T09:00:00+08:00').getTime();
 const CUTOFF_DAYS = 14;
 
 // ============================================================
-// ROSTER — hardcoded, Days: [Mon,Tue,Wed,Thu,Fri,Sat,Sun]
+// ROSTER
 // ============================================================
 const ROSTER = {
   '2009869833': { name:'Queency', role:'VA',     days:[1,1,1,1,1,0,0], start:'8:00 PM',  end:'5:00 AM' },
@@ -56,16 +64,29 @@ const ROSTER = {
 };
 
 // ============================================================
-// STATE — in-memory
+// STATE HELPERS (Now using Redis)
 // ============================================================
-const STATE = {};
+async function getState(uid) {
+    const data = await redisClient.get(`state:${uid}`);
+    return data ? JSON.parse(data) : { status: 'out' };
+}
 
-// In-memory cutoff hours — seeded via /seed-cutoff, updated on /out
-const CUTOFF = {};
+async function setState(uid, s) {
+    await redisClient.set(`state:${uid}`, JSON.stringify(s));
+}
 
-function getState(uid) { return STATE[uid] || { status: 'out' }; }
-function setState(uid, s) { STATE[uid] = s; }
-function clearState(uid) { delete STATE[uid]; }
+async function clearState(uid) {
+    await redisClient.del(`state:${uid}`);
+}
+
+async function getCutoffMemory(uid) {
+    const data = await redisClient.get(`cutoff:${uid}`);
+    return data ? JSON.parse(data) : { hours: 0, ot: 0 };
+}
+
+async function setCutoffMemory(uid, c) {
+    await redisClient.set(`cutoff:${uid}`, JSON.stringify(c));
+}
 
 // ============================================================
 // UTILITIES
@@ -164,7 +185,7 @@ async function sendMsg(text, chatId, topicId) {
 }
 
 // ============================================================
-// GOOGLE SHEETS — via Service Account
+// GOOGLE SHEETS
 // ============================================================
 let googleToken = null;
 let googleTokenExpiry = 0;
@@ -248,70 +269,42 @@ async function sheetsUpdate(range, values) {
   } catch(e) { console.error('sheetsUpdate:', e.message); }
 }
 
-// ============================================================
-// TELEGRAM LOG — simple append to Telegram Logs sheet
-// ============================================================
 async function logAction(uid, name, action, now) {
-  console.log(`logAction called: ${action} by ${name} (${uid})`);
-  console.log(`SHEET_ID: ${SHEET_ID ? 'set' : 'NOT SET'}, GOOGLE_SA: ${GOOGLE_SA ? 'set' : 'NOT SET'}`);
   try {
     const token = await getGoogleToken();
-    console.log(`Token: ${token ? 'obtained' : 'FAILED'}`);
     if (!token) return;
     const range = encodeURIComponent("'Telegram Logs'!A:E");
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}:append`;
-    console.log(`Calling sheets API: ${url.substring(0, 80)}`);
-    const res = await axios.post(url,
+    await axios.post(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}:append`,
       { values: [[fmtDate(now), fmtTime(now), action, name, uid]] },
       { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: `Bearer ${token}` } }
     );
-    console.log(`Sheets append success: ${res.status}`);
-  } catch(e) {
-    console.error('logAction error:', e.response?.data || e.message);
-  }
+  } catch(e) { console.error('logAction error:', e.message); }
 }
 
 // ============================================================
-// USER LOGS — column-per-user format
-// Col layout per user: Activity | Start | End | Duration (4 cols)
-// Row 1: User names (merged)
-// Row 2: Headers
-// Row 3+: Data
+// USER LOGS
 // ============================================================
-
-// In-memory column map: { userId: colIndex (0-based) }
 const USER_COL_MAP = {};
 const COLS_PER_USER = 4;
-let userLogsHeaders = null; // cached row 1
 
 async function initUserLogMap() {
   if (!SHEET_ID || !GOOGLE_SA) return;
   try {
     const row1 = await sheetsGet("'User Logs'!1:1");
-    if (!row1 || !row1[0]) {
-      console.log('User Logs sheet not found or empty — skipping column map');
-      return;
-    }
-    userLogsHeaders = row1[0];
-    for (let i = 0; i < userLogsHeaders.length; i += COLS_PER_USER) {
-      const name = userLogsHeaders[i];
+    if (!row1 || !row1[0]) return;
+    const headers = row1[0];
+    for (let i = 0; i < headers.length; i += COLS_PER_USER) {
+      const name = headers[i];
       if (!name) continue;
       const uid = Object.keys(ROSTER).find(k => ROSTER[k].name === name);
       if (uid) USER_COL_MAP[uid] = i;
     }
-    console.log(`User Log map initialized: ${Object.keys(USER_COL_MAP).length} users`);
   } catch(e) { console.error('initUserLogMap:', e.message); }
 }
 
 function colLetter(idx) {
-  // Convert 0-based column index to sheet letter (A, B, ... Z, AA, AB...)
-  let col = '';
-  let n = idx + 1;
-  while (n > 0) {
-    const r = (n - 1) % 26;
-    col = String.fromCharCode(65 + r) + col;
-    n = Math.floor((n - 1) / 26);
-  }
+  let col = ''; let n = idx + 1;
+  while (n > 0) { const r = (n - 1) % 26; col = String.fromCharCode(65 + r) + col; n = Math.floor((n - 1) / 26); }
   return col;
 }
 
@@ -324,33 +317,26 @@ async function getUserLogCol(uid) {
 async function addUserLogRow(uid, activity, startTime) {
   const col = await getUserLogCol(uid);
   if (col === undefined) return null;
-
-  // Find next empty row (get last row in user's activity column)
   const colA = colLetter(col);
   const data = await sheetsGet(`'User Logs'!${colA}3:${colA}1000`);
   const nextRow = 3 + (data ? data.length : 0);
-
   const actCol   = colLetter(col);
   const startCol = colLetter(col + 1);
-  const range    = `'User Logs'!${actCol}${nextRow}:${startCol}${nextRow}`;
-  await sheetsUpdate(range, [[activity, fmtTime(startTime)]]);
+  await sheetsUpdate(`'User Logs'!${actCol}${nextRow}:${startCol}${nextRow}`, [[activity, fmtTime(startTime)]]);
   return nextRow;
 }
 
 async function closeUserLogRow(uid, activity, endTime, startTime) {
   const col = await getUserLogCol(uid);
   if (col === undefined) return;
-
   const actCol = colLetter(col);
   const data   = await sheetsGet(`'User Logs'!${actCol}3:${actCol}1000`);
   if (!data) return;
-
-  // Find last row with this activity and no end time
   for (let i = data.length - 1; i >= 0; i--) {
     if (data[i][0] === activity) {
-      const rowNum   = 3 + i;
-      const endCol   = colLetter(col + 2);
-      const durCol   = colLetter(col + 3);
+      const rowNum    = 3 + i;
+      const endCol    = colLetter(col + 2);
+      const durCol    = colLetter(col + 3);
       const duration = fmtDuration(msBetween(startTime, endTime));
       await sheetsUpdate(`'User Logs'!${endCol}${rowNum}:${durCol}${rowNum}`, [[fmtTime(endTime), duration]]);
       return;
@@ -358,33 +344,21 @@ async function closeUserLogRow(uid, activity, endTime, startTime) {
   }
 }
 
-// For Leaders: update existing Shift row's end time and duration
 async function updateLeaderShiftRow(uid, endTime) {
   const col = await getUserLogCol(uid);
   if (col === undefined) return;
-
   const actCol = colLetter(col);
   const data   = await sheetsGet(`'User Logs'!${actCol}3:${actCol}1000`);
   if (!data) return;
-
   for (let i = data.length - 1; i >= 0; i--) {
     if (data[i][0] === 'Shift') {
       const rowNum    = 3 + i;
-      const startCol  = colLetter(col + 1);
-      const startData = await sheetsGet(`'User Logs'!${startCol}${rowNum}:${startCol}${rowNum}`);
-      const startStr  = startData && startData[0] ? startData[0][0] : null;
-
       const endCol = colLetter(col + 2);
       const durCol = colLetter(col + 3);
-
       let durStr = '';
-      if (startStr) {
-        // Parse start time string back to Date for duration calc
-        // Just store formatted times — duration calc done on logout
-        const state = getState(uid);
-        if (state.loginTime) {
-          durStr = fmtDuration(msBetween(new Date(state.loginTime), endTime));
-        }
+      const state = await getState(uid);
+      if (state.loginTime) {
+        durStr = fmtDuration(msBetween(new Date(state.loginTime), endTime));
       }
       await sheetsUpdate(`'User Logs'!${endCol}${rowNum}:${durCol}${rowNum}`, [[fmtTime(endTime), durStr]]);
       return;
@@ -406,30 +380,24 @@ async function getCutoffHours(uid) {
 }
 
 async function addCutoffHours(uid, name, role, addHours, addOT) {
-  // Update in-memory first (instant, no sheet dependency)
-  if (!CUTOFF[uid]) CUTOFF[uid] = { hours: 0, ot: 0 };
-  const newHours = Math.round((CUTOFF[uid].hours + addHours) * 100) / 100;
-  const newOT    = Math.round((CUTOFF[uid].ot + (addOT||0)) * 100) / 100;
-  // Apply 90h cap for Leaders
+  let mem = await getCutoffMemory(uid);
+  const newHours = Math.round((mem.hours + addHours) * 100) / 100;
+  const newOT    = Math.round((mem.ot + (addOT||0)) * 100) / 100;
+  
   if (role === 'Leader') {
     const combined = newHours + newOT;
     if (combined > LEADER_MAX_HRS) {
-      CUTOFF[uid].hours = Math.min(newHours, LEADER_MAX_HRS);
-      CUTOFF[uid].ot    = Math.max(0, LEADER_MAX_HRS - CUTOFF[uid].hours);
-    } else {
-      CUTOFF[uid].hours = newHours;
-      CUTOFF[uid].ot    = newOT;
-    }
-  } else {
-    CUTOFF[uid].hours = newHours;
-    CUTOFF[uid].ot    = newOT;
-  }
+      mem.hours = Math.min(newHours, LEADER_MAX_HRS);
+      mem.ot    = Math.max(0, LEADER_MAX_HRS - mem.hours);
+    } else { mem.hours = newHours; mem.ot = newOT; }
+  } else { mem.hours = newHours; mem.ot = newOT; }
+  
+  await setCutoffMemory(uid, mem);
 
   try {
     const current = await getCutoffHours(uid);
     const now     = new Date();
     const co      = getCutoffDates(role);
-
     if (current.row) {
       await sheetsUpdate(`'Cutoff Counter'!F${current.row}:H${current.row}`, [[
         Math.round((current.hours + addHours) * 100) / 100,
@@ -438,853 +406,273 @@ async function addCutoffHours(uid, name, role, addHours, addOT) {
       ]]);
     } else {
       await sheetsAppend("'Cutoff Counter'!A:H", [[
-        uid, name, role,
-        fmtDate(co.start), fmtDate(co.end),
-        Math.round(addHours * 100) / 100,
-        Math.round((addOT||0) * 100) / 100,
-        fmtTime(now),
+        uid, name, role, fmtDate(co.start), fmtDate(co.end),
+        Math.round(addHours * 100) / 100, Math.round((addOT||0) * 100) / 100, fmtTime(now),
       ]]);
     }
-  } catch(e) { console.error('addCutoffHours:', e.message); }
+  } catch(e) { console.error('addCutoffHours error:', e.message); }
 }
 
 // ============================================================
-// PAYABLE HOURS CALCULATION
+// PAYABLE CALC
 // ============================================================
 function calcPayable(uid, state, logoutTime) {
   const role     = ROSTER[uid]?.role || 'VA';
   const isLeader = role === 'Leader';
   const login    = new Date(state.loginTime);
-  const logout   = logoutTime;
-
-  const manila  = manilaTime();
-  const sched   = getSchedule(uid, manila) || ROSTER[uid];
-  const dateStr = state.shiftDate || getManilaDateStr(manila);
-  const win     = getShiftWindow(sched, dateStr);
-
+  const manila   = manilaTime();
+  const sched    = getSchedule(uid, manila) || ROSTER[uid];
+  const dateStr  = state.shiftDate || getManilaDateStr(manila);
+  const win      = getShiftWindow(sched, dateStr);
   const effLogin  = login  > win.start ? login  : win.start;
-  const effLogout = logout < win.end   ? logout : win.end;
-
+  const effLogout = logoutTime < win.end ? logoutTime : win.end;
   let lateMs = Math.max(0, effLogin.getTime() - win.start.getTime());
   if (lateMs <= GRACE_MINS * 60000) lateMs = 0;
-
   let grossMs = Math.max(0, effLogout.getTime() - effLogin.getTime());
-
-  // Lunch deduction
   const diffMins = minsBetween(win.start, win.end);
   const hasLunch = diffMins >= 510;
   let lunchMs = 0;
   if (hasLunch) lunchMs = state.bblUsed ? LUNCH_MINS * 60000 : (state.lunchUsedMs || 0);
-
   let netMs = Math.max(0, grossMs - lunchMs - (state.overbreakMs||0) - (state.overlunchMs||0) - lateMs);
   let hours = netMs / 3600000;
   if (!isLeader) hours = Math.min(hours, MAX_HRS);
-
   let ot = 0;
-  const userRole = ROSTER[uid]?.role || 'VA';
-  if (userRole === 'Leader' && login < win.start) {
+  if (role === 'Leader' && login < win.start) {
     const preShiftMs = win.start.getTime() - login.getTime();
     ot = Math.floor(preShiftMs / (30 * 60000)) * 0.5;
   }
-
-  return {
-    hours: Math.round(hours * 100) / 100,
-    ot:    Math.round(ot * 100) / 100,
-  };
+  return { hours: Math.round(hours * 100) / 100, ot: Math.round(ot * 100) / 100 };
 }
 
 // ============================================================
 // HANDLERS
 // ============================================================
-
 async function handleIn(uid, name) {
   const manila = manilaTime();
   const sched  = getSchedule(uid, manila);
-  const state  = getState(uid);
+  const state  = await getState(uid);
   const now    = new Date();
-
-  // Already logged in
-  if (state.status !== 'out' && state.status !== 'holiday' && state.status !== 'absent' && state.status !== 'leave' && state.status !== 'vto') {
-    return `⚠️ Heads up, ${name} — you're already logged in! If this is an error, please contact your manager.`;
+  if (state.status !== 'out' && !['holiday','absent','leave','vto'].includes(state.status)) {
+    return `⚠️ Heads up, ${name} — you're already logged in!`;
   }
-
-  // No schedule today
-  if (!sched) {
-    return `📋 Hi ${name}, today doesn't seem to be a scheduled workday for you. If you think this is an error, please reach out to your manager.`;
-  }
-
+  if (!sched) return `📋 Hi ${name}, today doesn't seem to be a scheduled workday.`;
   const dateStr = getManilaDateStr(manila);
   const win     = getShiftWindow(sched, dateStr);
   const minsToShift = minsBetween(now, win.start);
   const minsLate    = minsBetween(win.start, now);
-
-  // Determine status
   const isLate        = minsLate > GRACE_MINS;
-  const isVeryEarly   = minsToShift > EARLY_LIMIT;  // more than 30 mins early
-  const isSlightEarly = minsToShift > 0 && minsToShift <= EARLY_LIMIT; // within 30 mins early
+  const isVeryEarly   = minsToShift > EARLY_LIMIT;
+  const isSlightEarly = minsToShift > 0 && minsToShift <= EARLY_LIMIT;
 
-  setState(uid, {
-    status:      (isVeryEarly || isSlightEarly) ? 'pre-shift' : 'in',
-    loginTime:   now.toISOString(),
-    shiftDate:   dateStr,
-    shiftStart:  win.start.toISOString(),
-    breakUsed:   0,
-    bblUsed:     false,
-    lunchUsed:   false,
-    lunchUsedMs: 0,
-    overbreakMs: 0,
-    overlunchMs: 0,
-    breakStart:  null,
-    breakType:   null,
-    isLate:      isLate,
-    lateMs:      isLate ? minsLate * 60000 : 0,
+  await setState(uid, {
+    status: (isVeryEarly || isSlightEarly) ? 'pre-shift' : 'in',
+    loginTime: now.toISOString(),
+    shiftDate: dateStr,
+    shiftStart: win.start.toISOString(),
+    breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+    overbreakMs: 0, overlunchMs: 0, breakStart: null, breakType: null,
+    isLate: isLate, lateMs: isLate ? minsLate * 60000 : 0,
   });
 
   addUserLogRow(uid, 'Shift', now).catch(console.error);
   logAction(uid, name, 'in', now).catch(console.error);
-
-  // Very early (30+ mins before shift) — accepted but show shift time
-  if (isVeryEarly) {
-    return `🌅 Log In confirmed — ${name}. You're early today! Your shift starts at ${fmtTime(win.start)} Manila. We'll mark you active then. 💪`;
-  }
-
-  // Slightly early (within 30 mins) — regular login message
-  if (isSlightEarly) {
-    return `✅ Log In confirmed — ${name}. Your shift for today starts at ${fmtTime(win.start)} Manila. Have a great shift! 💪`;
-  }
-
-  if (isLate) {
-    return `⏰ Log In confirmed — ${name}. Your shift started at ${fmtTime(win.start)} Manila. You're ${minsLate} minute(s) late — this will be reflected in your hours.`;
-  }
-
-  return `✅ Log In confirmed — ${name}. Your shift for today starts at ${fmtTime(win.start)} Manila. Have a great shift! 💪`;
+  if (isVeryEarly) return `🌅 Log In confirmed — ${name}. You're early! Shift starts at ${fmtTime(win.start)}.`;
+  if (isSlightEarly) return `✅ Log In confirmed — ${name}. Shift starts at ${fmtTime(win.start)}.`;
+  if (isLate) return `⏰ Log In confirmed — ${name}. You're ${minsLate} minute(s) late.`;
+  return `✅ Log In confirmed — ${name}. Have a great shift! 💪`;
 }
 
 async function handleOut(uid, name) {
-  const state = getState(uid);
+  const state = await getState(uid);
   const now   = new Date();
+  if (state.status === 'out') return `⚠️ ${name}, you're not logged in.`;
 
-  // Auto-promote pre-shift to in if shift has started
-  if (state.status === 'pre-shift' && state.shiftStart) {
-    const shiftStart = new Date(state.shiftStart);
-    if (new Date() >= shiftStart) {
-      state.status = 'in';
-      setState(uid, state);
-    }
-  }
+  if (state.status === 'pre-shift' && state.shiftStart && now >= new Date(state.shiftStart)) state.status = 'in';
 
-  if (state.status === 'out') {
-    return `⚠️ ${name}, you're not currently logged in. If this is an error, please contact your manager.`;
-  }
-
-  // Auto-close any open break
-  if (state.status !== 'in') {
-    const breakMins = state.breakStart ? minsBetween(new Date(state.breakStart), now) : 0;
-    const allowed   = state.breakType==='bbl' ? BBL_MINS : state.breakType==='lunch' ? LUNCH_MINS : state.breakType==='30' ? 30 : 15;
-    const over      = breakMins - allowed - GRACE_MINS;
+  if (state.status !== 'in' && state.status !== 'pre-shift') {
+    const bt = state.breakType;
+    const allowed = bt==='bbl' ? BBL_MINS : bt==='lunch' ? LUNCH_MINS : bt==='30' ? 30 : 15;
+    const actual = state.breakStart ? minsBetween(new Date(state.breakStart), now) : 0;
+    const over = actual - allowed - GRACE_MINS;
     if (over > 0) {
-      if (state.breakType==='lunch'||state.breakType==='bbl') state.overlunchMs=(state.overlunchMs||0)+over*60000;
-      else state.overbreakMs=(state.overbreakMs||0)+over*60000;
+        if (bt==='lunch'||bt==='bbl') state.overlunchMs=(state.overlunchMs||0)+over*60000;
+        else state.overbreakMs=(state.overbreakMs||0)+over*60000;
     }
-    // Close break row
-    const breakLabels = {'15':'Break 15','30':'Break 30','lunch':'Lunch','bbl':'BBL'};
-    if (state.breakType && state.breakStart) {
-      closeUserLogRow(uid, breakLabels[state.breakType]||'Break', now, new Date(state.breakStart)).catch(console.error);
-    }
+    const labels = {'15':'Break 15','30':'Break 30','lunch':'Lunch','bbl':'BBL'};
+    if (bt && state.breakStart) closeUserLogRow(uid, labels[bt]||'Break', now, new Date(state.breakStart)).catch(console.error);
   }
 
   const result = state.loginTime ? calcPayable(uid, state, now) : { hours: 0, ot: 0 };
   const role   = ROSTER[uid]?.role || 'VA';
+  if (role === 'Leader') updateLeaderShiftRow(uid, now).catch(console.error);
+  else closeUserLogRow(uid, 'Shift', now, new Date(state.loginTime)).catch(console.error);
 
-  // Update User Logs
-  if (role === 'Leader') {
-    updateLeaderShiftRow(uid, now).catch(console.error);
-  } else {
-    closeUserLogRow(uid, 'Shift', now, new Date(state.loginTime)).catch(console.error);
-  }
-
-  // Update Cutoff Counter
-  addCutoffHours(uid, name, role, result.hours, result.ot).catch(console.error);
-
-  clearState(uid);
-
-  const hoursStr = result.hours.toFixed(2);
-  const otStr    = result.ot > 0 ? ` (+${result.ot.toFixed(2)}h OT)` : '';
-  return `👋 Log Out confirmed — ${name}. Total hours for today: <b>${hoursStr}h${otStr}</b>. Contact your manager for any disputes.`;
+  await addCutoffHours(uid, name, role, result.hours, result.ot);
+  await clearState(uid);
+  return `👋 Log Out confirmed — ${name}. Today: <b>${result.hours.toFixed(2)}h${result.ot > 0 ? ` (+${result.ot.toFixed(2)}h OT)` : ''}</b>.`;
 }
 
 async function handleBreak(uid, name, breakType) {
-  const state = getState(uid);
+  const state = await getState(uid);
   const now   = new Date();
+  if (state.status === 'pre-shift' && state.shiftStart && now >= new Date(state.shiftStart)) state.status = 'in';
+  if (state.status === 'out') return `⚠️ ${name}, login first!`;
+  if (state.status !== 'in') return `⚠️ ${name}, already on break!`;
 
-  // Auto-promote pre-shift if shift started
-  if (state.status === 'pre-shift' && state.shiftStart && new Date() >= new Date(state.shiftStart)) {
-    state.status = 'in';
-    setState(uid, state);
-  }
-
-  if (state.status === 'out') {
-    return `⚠️ ${name}, you need to log in first before taking a break!`;
-  }
-  if (state.status !== 'in') {
-    return `⚠️ ${name}, you're already on a break! Please /back first before starting another.`;
-  }
-
-  const allowed = breakType==='bbl' ? BBL_MINS : breakType==='lunch' ? LUNCH_MINS : breakType==='30' ? 30 : 15;
-  const back    = new Date(now.getTime() + allowed * 60000);
-
-  // Break pool checks
   if (breakType === '15' || breakType === '30') {
-    if (state.bblUsed) return `⚠️ ${name}, you've already used your BBL for this shift. No additional breaks available.`;
-    const wouldUse = (state.breakUsed||0) + (breakType==='15' ? 15 : 30);
-    if (wouldUse > 30) return `⚠️ ${name}, you've reached your break limit for this shift (30 minutes total).`;
+    if (state.bblUsed) return `⚠️ Already used BBL.`;
+    if ((state.breakUsed||0) + (breakType==='15' ? 15 : 30) > 30) return `⚠️ Break limit reached.`;
   }
-  if (breakType === 'bbl' && (state.bblUsed || (state.breakUsed||0) > 0)) {
-    return `⚠️ ${name}, you've already used your break allowance for this shift.`;
-  }
-  if (breakType === 'lunch' && state.lunchUsed) {
-    return `⚠️ ${name}, you've already taken your lunch for this shift.`;
-  }
+  if (breakType === 'bbl' && (state.bblUsed || (state.breakUsed||0) > 0)) return `⚠️ Break already used.`;
+  if (breakType === 'lunch' && state.lunchUsed) return `⚠️ Lunch already taken.`;
 
-  setState(uid, { ...state, status: breakType, breakStart: now.toISOString(), breakType });
-
-  // Log to User Logs
+  state.status = breakType; state.breakStart = now.toISOString(); state.breakType = breakType;
+  await setState(uid, state);
   const labels = {'15':'Break 15','30':'Break 30','lunch':'Lunch','bbl':'BBL'};
   addUserLogRow(uid, labels[breakType]||breakType, now).catch(console.error);
-
-  if (breakType==='15')    return `⏸️ Break confirmed — ${name}. Be back by <b>${fmtTime(back)}</b>. ☕`;
-  if (breakType==='30')    return `⏸️ Break confirmed — ${name}. Be back by <b>${fmtTime(back)}</b>. ☕`;
-  if (breakType==='lunch') return `🍽️ Lunch confirmed — ${name}. Be back by <b>${fmtTime(back)}</b>. Enjoy!`;
-  if (breakType==='bbl')   return `🍽️ Lunch & Break confirmed — ${name}. Be back by <b>${fmtTime(back)}</b>. Enjoy!`;
+  const allowed = breakType==='bbl' ? BBL_MINS : breakType==='lunch' ? LUNCH_MINS : breakType==='30' ? 30 : 15;
+  return `⏸️ Break confirmed — ${name}. Back by <b>${fmtTime(new Date(now.getTime() + allowed * 60000))}</b>.`;
 }
 
 async function handleBack(uid, name) {
-  const state = getState(uid);
+  const state = await getState(uid);
   const now   = new Date();
+  if (state.status === 'out') return `⚠️ ${name}, not logged in.`;
+  if (state.status === 'in') return `⚠️ ${name}, not on break.`;
 
-  // Auto-promote pre-shift if shift started
-  if (state.status === 'pre-shift' && state.shiftStart && new Date() >= new Date(state.shiftStart)) {
-    state.status = 'in';
-    setState(uid, state);
-  }
-
-  if (state.status === 'out') {
-    return `⚠️ ${name}, you're not currently logged in.`;
-  }
-  if (state.status === 'in') {
-    return `⚠️ ${name}, you're not on a break! No need to punch back.`;
-  }
-
-  const bt      = state.breakType || '15';
+  const bt = state.breakType;
   const allowed = bt==='bbl' ? BBL_MINS : bt==='lunch' ? LUNCH_MINS : bt==='30' ? 30 : 15;
-  const actual  = state.breakStart ? minsBetween(new Date(state.breakStart), now) : 0;
-  const over    = actual - allowed - GRACE_MINS;
+  const actual = state.breakStart ? minsBetween(new Date(state.breakStart), now) : 0;
+  const over = actual - allowed - GRACE_MINS;
 
-  if (bt==='15')    state.breakUsed = (state.breakUsed||0) + 15;
-  if (bt==='30')    state.breakUsed = (state.breakUsed||0) + 30;
-  if (bt==='bbl')   { state.bblUsed=true; state.lunchUsedMs=LUNCH_MINS*60000; state.lunchUsed=true; }
+  if (bt==='15') state.breakUsed = (state.breakUsed||0) + 15;
+  if (bt==='30') state.breakUsed = (state.breakUsed||0) + 30;
+  if (bt==='bbl') { state.bblUsed=true; state.lunchUsed=true; state.lunchUsedMs=LUNCH_MINS*60000; }
   if (bt==='lunch') { state.lunchUsed=true; state.lunchUsedMs=LUNCH_MINS*60000; }
 
-  let overMsg = '';
+  let overMsg = over > 0 ? ` You were ${over}m over.` : '';
   if (over > 0) {
-    if (bt==='lunch'||bt==='bbl') {
-      state.overlunchMs=(state.overlunchMs||0)+over*60000;
-      overMsg = ` You were ${over} minute(s) over your lunch — this will be reflected in your hours.`;
-    } else {
-      state.overbreakMs=(state.overbreakMs||0)+over*60000;
-      overMsg = ` You were ${over} minute(s) over your break — this will be reflected in your hours.`;
-    }
+    if (bt==='lunch'||bt==='bbl') state.overlunchMs=(state.overlunchMs||0)+over*60000;
+    else state.overbreakMs=(state.overbreakMs||0)+over*60000;
   }
-
-  // Close break row in User Logs
   const labels = {'15':'Break 15','30':'Break 30','lunch':'Lunch','bbl':'BBL'};
-  if (state.breakStart) {
-    closeUserLogRow(uid, labels[bt]||bt, now, new Date(state.breakStart)).catch(console.error);
-  }
+  if (state.breakStart) closeUserLogRow(uid, labels[bt]||bt, now, new Date(state.breakStart)).catch(console.error);
 
   state.status='in'; state.breakStart=null; state.breakType=null;
-  setState(uid, state);
-
+  await setState(uid, state);
   return `✅ Welcome back, ${name}!${overMsg}`;
 }
 
 async function handleOffsetIn(uid, name) {
-  const now  = new Date();
-  const state = getState(uid);
-
-  // Block if within shift hours
-  if (isWithinShift(uid, now)) {
-    return `⚠️ ${name}, offset hours cannot be logged during your scheduled shift. Please use the regular /in command.`;
-  }
-  if (state.status === 'offset') {
-    return `⚠️ ${name}, you already have an active offset session. Please /offset-out first.`;
-  }
-
+  const now = new Date(); const state = await getState(uid);
+  if (isWithinShift(uid, now)) return `⚠️ Cannot log offset during shift.`;
+  if (state.status === 'offset') return `⚠️ Offset already active.`;
   const role = ROSTER[uid]?.role || 'VA';
-  const current = await getCutoffHours(uid);
-  const remaining = Math.max(0, TARGET_HRS - current.hours);
-  const remainingStr = role === 'Leader' ? '' : ` Remaining this cutoff: <b>${remaining.toFixed(2)}h</b>`;
-
-  setState(uid, { ...state, status:'offset', offsetStart: now.toISOString() });
+  const cur = await getCutoffHours(uid);
+  const rem = Math.max(0, TARGET_HRS - cur.hours);
+  await setState(uid, { ...state, status:'offset', offsetStart: now.toISOString() });
   addUserLogRow(uid, 'Offset', now).catch(console.error);
-
-  return `⏱️ Offset confirmed — ${name}.${remainingStr} Make it count! 💪`;
+  return `⏱️ Offset confirmed — ${name}.${role==='Leader'?'':` Remaining: ${rem.toFixed(2)}h`}`;
 }
 
 async function handleOffsetOut(uid, name) {
-  const state = getState(uid);
-  const now   = new Date();
-
-  if (state.status !== 'offset') {
-    return `⚠️ ${name}, you don't have an active offset session.`;
-  }
-
-  const startTime   = new Date(state.offsetStart);
-  const durationMs  = msBetween(startTime, now);
-  const durationHrs = durationMs / 3600000;
-
-  const role    = ROSTER[uid]?.role || 'VA';
-  const current = await getCutoffHours(uid);
-  const newTotal = current.hours + durationHrs;
-  const remaining = Math.max(0, TARGET_HRS - newTotal);
-  const remainingStr = role === 'Leader' ? '' : ` Remaining this cutoff: <b>${remaining.toFixed(2)}h</b>`;
-
-  // Update logs and cutoff
-  closeUserLogRow(uid, 'Offset', now, startTime).catch(console.error);
-  addCutoffHours(uid, name, role, durationHrs, 0).catch(console.error);
-
-  setState(uid, { ...state, status:'out', offsetStart:null });
-
-  return `✅ Offset hours logged — ${name}. Total: <b>${fmtDuration(durationMs)}</b>.${remainingStr}`;
+  const state = await getState(uid); const now = new Date();
+  if (state.status !== 'offset') return `⚠️ No active offset.`;
+  const start = new Date(state.offsetStart);
+  const durMs = msBetween(start, now); const durHrs = durMs/3600000;
+  const role = ROSTER[uid]?.role || 'VA';
+  const cur = await getCutoffHours(uid);
+  const rem = Math.max(0, TARGET_HRS - (cur.hours + durHrs));
+  closeUserLogRow(uid, 'Offset', now, start).catch(console.error);
+  await addCutoffHours(uid, name, role, durHrs, 0);
+  await setState(uid, { ...state, status:'out', offsetStart:null });
+  return `✅ Offset logged — ${name}. Total: ${fmtDuration(durMs)}.${role==='Leader'?'':` Remaining: ${rem.toFixed(2)}h`}`;
 }
 
 async function handleDayOverride(uid, name, type) {
-  const state = getState(uid);
-  const now   = new Date();
-
-  const validTypes = ['holiday','absent','leave','vto'];
-  if (!validTypes.includes(type)) return null;
-
-  // Check if already punched today
-  if (state.dayOverride) {
-    const typeNames = { holiday:'Holiday', absent:'Absent', leave:'Leave', vto:'VTO' };
-    return `⚠️ ${name}, you've already logged <b>${typeNames[state.dayOverride]}</b> for today.`;
-  }
-
+  const state = await getState(uid); const now = new Date();
+  if (state.dayOverride) return `⚠️ Already logged ${state.dayOverride}.`;
   const addsHours = type === 'holiday' || type === 'leave';
-  const role      = ROSTER[uid]?.role || 'VA';
-
-  setState(uid, { ...state, status: type, dayOverride: type });
-
-  if (addsHours) {
-    addCutoffHours(uid, name, role, MAX_HRS, 0).catch(console.error);
-  }
-
-  // Log to User Logs
+  const role = ROSTER[uid]?.role || 'VA';
+  await setState(uid, { ...state, status: type, dayOverride: type });
+  if (addsHours) await addCutoffHours(uid, name, role, MAX_HRS, 0);
   addUserLogRow(uid, type.toUpperCase(), now).catch(console.error);
-
-  const messages = {
-    holiday: `🎉 Holiday logged — ${name}. Enjoy your day off! You're all set.`,
-    absent:  `📋 Absent logged — ${name}. Please coordinate with your manager.`,
-    leave:   `🌴 Leave logged — ${name}. Enjoy your time off!`,
-    vto:     `✅ VTO logged — ${name}. Thank you for volunteering your time off!`,
-  };
-
-  return messages[type];
+  return `✅ ${type.toUpperCase()} logged — ${name}.`;
 }
 
-// ============================================================
-// HIDDEN COMMANDS
-// ============================================================
-
 async function handleStatus(uid, name) {
-  const state = getState(uid);
-  const statusMap = {
-    'out':     '🔴 Logged Out',
-    'in':      '🟢 Active',
-    '15':      '🔵 On 15-min Break',
-    '30':      '🔵 On 30-min Break',
-    'lunch':   '🔵 On Lunch',
-    'bbl':     '🔵 On BBL',
-    'offset':  '⏱️ On Offset',
-    'holiday': '🎉 Holiday',
-    'absent':  '📋 Absent',
-    'leave':   '🌴 On Leave',
-    'vto':     '✅ VTO',
-  };
-
-  const statusStr = statusMap[state.status] || '🔴 Logged Out';
-  let msg = `📊 <b>Status — ${name}</b>\nCurrent: ${statusStr}`;
-
-  if (state.loginTime && state.status === 'in') {
-    const elapsed = minsBetween(new Date(state.loginTime), new Date());
-    msg += `\nLogged in for: <b>${Math.floor(elapsed/60)}h ${elapsed%60}m</b>`;
-  }
-  if (state.breakStart) {
-    const elapsed = minsBetween(new Date(state.breakStart), new Date());
-    msg += `\nOn break for: <b>${elapsed}m</b>`;
-  }
-
+  const state = await getState(uid);
+  const sm = { 'out':'🔴 Out','in':'🟢 Active','15':'🔵 Break','30':'🔵 Break','lunch':'🔵 Lunch','bbl':'🔵 BBL','offset':'⏱️ Offset' };
+  let msg = `📊 Status: ${sm[state.status]||'🔴 Out'}`;
+  if (state.loginTime && state.status==='in') msg += `\nIn for: ${fmtDuration(msBetween(new Date(state.loginTime), new Date()))}`;
   return msg;
 }
 
 async function handleTotal(uid, name) {
-  const role    = ROSTER[uid]?.role || 'VA';
-  const current = await getCutoffHours(uid);
-  const co      = getCutoffDates(role);
-  const target  = role === 'Leader' ? 'Flexible' : `${TARGET_HRS}h`;
-  const remaining = role === 'Leader' ? '—' : `${Math.max(0, TARGET_HRS - current.hours).toFixed(2)}h`;
-
-  return `📈 <b>Cutoff Hours — ${name}</b>\n` +
-    `Role: <b>${role}</b>\n` +
-    `Period: <b>${fmtDate(co.start)} – ${fmtDate(co.end)}</b>\n` +
-    `Logged: <b>${current.hours.toFixed(2)}h</b>${current.ot > 0 ? ` (+${current.ot.toFixed(2)}h OT)` : ''}\n` +
-    `Target: <b>${target}</b>\n` +
-    `Remaining: <b>${remaining}</b>`;
+  const role = ROSTER[uid]?.role || 'VA';
+  const cur = await getCutoffHours(uid);
+  const co = getCutoffDates(role);
+  return `📈 <b>Cutoff — ${name}</b>\nLogged: ${cur.hours.toFixed(2)}h${cur.ot>0?` (+${cur.ot.toFixed(2)}h OT)` : ''}\nPeriod: ${fmtDate(co.start)} - ${fmtDate(co.end)}`;
 }
 
 async function handleSched(uid, name) {
-  const entry = ROSTER[uid];
-  if (!entry) return `⚠️ ${name}, no schedule found.`;
-
+  const entry = ROSTER[uid]; if (!entry) return `⚠️ No schedule.`;
   const days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  const workDays = days.filter((d,i) => entry.days[i]);
-
-  return `📅 <b>Schedule — ${name}</b>\n` +
-    `Role: <b>${entry.role}</b>\n` +
-    `Days: <b>${workDays.join(', ')}</b>\n` +
-    `Shift: <b>${entry.start} – ${entry.end}</b>`;
+  const wd = days.filter((d,i) => entry.days[i]);
+  return `📅 <b>Sched — ${name}</b>\nDays: ${wd.join(', ')}\nShift: ${entry.start} - ${entry.end}`;
 }
 
-async function handleCutoff(uid, name) {
-  const role = ROSTER[uid]?.role || 'VA';
-  const co   = getCutoffDates(role);
-  const now  = new Date();
-  const daysLeft = Math.ceil((co.end - now) / 86400000);
-
-  const typeMap = {
-    'VA':     'Bi-weekly (every 2 Saturdays)',
-    'UYP':    'Semi-monthly (1st–15th, 16th–end)',
-    'Leader': 'Bi-weekly (every 2 Saturdays)',
-  };
-
-  return `📆 <b>Cutoff Info — ${name}</b>\n` +
-    `Type: <b>${typeMap[role] || 'Bi-weekly'}</b>\n` +
-    `Start: <b>${fmtDate(co.start)}</b>\n` +
-    `End: <b>${fmtDate(co.end)}</b>\n` +
-    `Days remaining: <b>${daysLeft}</b>\n` +
-    `Target hours: <b>${role === 'Leader' ? 'Flexible' : TARGET_HRS + 'h'}</b>`;
-}
-
-async function handleHelp(uid, name) {
-  return `📖 <b>Available Commands — ${name}</b>\n\n` +
-    `<b>Shift:</b>\n` +
-    `/in — Log in\n` +
-    `/out — Log out\n\n` +
-    `<b>Breaks:</b>\n` +
-    `/15 — 15-minute break\n` +
-    `/30 — 30-minute break\n` +
-    `/lunch — Lunch break\n` +
-    `/bbl — Lunch & break combined\n` +
-    `/back — Return from break\n\n` +
-    `<b>Day Override:</b>\n` +
-    `/holiday — Log holiday\n` +
-    `/absent — Log absence\n` +
-    `/leave — Log leave\n` +
-    `/vto — Log VTO\n\n` +
-    `<b>Info:</b>\n` +
-    `/status — Your current status\n` +
-    `/total — Your cutoff hours\n` +
-    `/sched — Your weekly schedule\n` +
-    `/cutoff — Cutoff period details`;
+async function handleHelp() {
+  return `📖 <b>Commands:</b>\n/in, /out\n/15, /30, /lunch, /bbl, /back\n/holiday, /absent, /leave\n/status, /total, /sched`;
 }
 
 // ============================================================
-// WEBHOOK
+// WEBHOOK & ENDPOINTS
 // ============================================================
 const processed = new Set();
-
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Always return 200 immediately
-
+  res.sendStatus(200);
   try {
-    const update  = req.body;
-    const msg     = update.message || update.channel_post;
-    if (!msg) return;
-
-    const chatId   = String(msg.chat.id);
-    const topicId  = msg.message_thread_id ? String(msg.message_thread_id) : null;
-    const uid      = String(msg.from.id);
-    const text     = (msg.text || '').trim().toLowerCase();
-    const name     = msg.from.first_name || msg.from.username || 'User';
-    const updateId = String(update.update_id);
-
-    // Filters
-    if (chatId !== ALLOWED_CHAT) return;
-    if (topicId !== TOPIC_ID)    return;
-
-    // Unknown user
-    if (!ROSTER[uid]) {
-      await sendMsg(`🚫 Unregistered user. Please contact your manager to get set up.`, chatId, topicId);
-      return;
-    }
-
-    // Dedup
-    if (processed.has(updateId)) return;
-    processed.add(updateId);
-    if (processed.size > 1000) processed.delete(processed.values().next().value);
-
-    // Route commands
+    const update = req.body; const msg = update.message || update.channel_post; if (!msg) return;
+    const cid = String(msg.chat.id); const tid = msg.message_thread_id ? String(msg.message_thread_id) : null;
+    const uid = String(msg.from.id); const text = (msg.text || '').trim().toLowerCase();
+    const name = msg.from.first_name || 'User';
+    if (cid !== ALLOWED_CHAT || tid !== TOPIC_ID || !ROSTER[uid]) return;
+    if (processed.has(update.update_id)) return; processed.add(update.update_id);
     let reply = null;
-
-    if      (text==='/in'        || text==='in')        reply = await handleIn(uid, name);
-    else if (text==='/out'       || text==='out')       reply = await handleOut(uid, name);
-    else if (text==='/back'      || text==='back')      reply = await handleBack(uid, name);
-    else if (text==='/15'        || text==='15')        reply = await handleBreak(uid, name, '15');
-    else if (text==='/30'        || text==='30')        reply = await handleBreak(uid, name, '30');
-    else if (text==='/lunch'     || text==='lunch')     reply = await handleBreak(uid, name, 'lunch');
-    else if (text==='/bbl'       || text==='bbl')       reply = await handleBreak(uid, name, 'bbl');
-    else if (text==='/offset-in' || text==='offset-in') reply = await handleOffsetIn(uid, name);
-    else if (text==='/offset-out'|| text==='offset-out')reply = await handleOffsetOut(uid, name);
-    else if (text==='/holiday'   || text==='holiday')   reply = await handleDayOverride(uid, name, 'holiday');
-    else if (text==='/absent'    || text==='absent')    reply = await handleDayOverride(uid, name, 'absent');
-    else if (text==='/leave'     || text==='leave')     reply = await handleDayOverride(uid, name, 'leave');
-    else if (text==='/vto'       || text==='vto')       reply = await handleDayOverride(uid, name, 'vto');
-    else if (text==='/status'    || text==='status')    reply = await handleStatus(uid, name);
-    else if (text==='/total'     || text==='total')     reply = await handleTotal(uid, name);
-    else if (text==='/sched'     || text==='sched')     reply = await handleSched(uid, name);
-    else if (text==='/cutoff'    || text==='cutoff')    reply = await handleCutoff(uid, name);
-    else if (text==='/help'      || text==='help')      reply = await handleHelp(uid, name);
-
-    if (reply) await sendMsg(reply, chatId, topicId);
-
-  } catch(err) {
-    console.error('webhook error:', err.message);
-  }
+    if (text==='/in' || text==='in') reply = await handleIn(uid, name);
+    else if (text==='/out' || text==='out') reply = await handleOut(uid, name);
+    else if (text==='/back' || text==='back') reply = await handleBack(uid, name);
+    else if (['/15','15','/30','30','/lunch','lunch','/bbl','bbl'].includes(text)) reply = await handleBreak(uid, name, text.replace('/',''));
+    else if (text==='/status') reply = await handleStatus(uid, name);
+    else if (text==='/total') reply = await handleTotal(uid, name);
+    else if (text==='/sched') reply = await handleSched(uid, name);
+    else if (text==='/help') reply = await handleHelp();
+    if (reply) await sendMsg(reply, cid, tid);
+  } catch(e) { console.error('webhook error:', e.message); }
 });
 
-// ============================================================
-// DASHBOARD ENDPOINT
-// ============================================================
 app.get('/dashboard', async (req, res) => {
-  const cb   = req.query.callback;
-  const data = await getDashboardData();
-  if (cb) {
-    res.setHeader('Content-Type', 'application/javascript');
-    res.send(`${cb}(${JSON.stringify(data)})`);
-  } else {
-    res.json(data);
-  }
-});
-
-async function getDashboardData() {
-  const now    = new Date();
-  const manila = manilaTime();
-  const users  = [];
-
-  // Use in-memory CUTOFF (always up to date, no sheet read needed)
-  const cutoffMap = CUTOFF;
-
+  const users = []; const now = new Date(); const manila = manilaTime();
   for (const [uid, entry] of Object.entries(ROSTER)) {
-    const state = getState(uid);
-    // If user is logged in, use their shiftDate for schedule lookup (handles overnight shifts)
-    let schedManila = manila;
-    if (state.shiftDate) {
-      schedManila = new Date(new Date(state.shiftDate + 'T12:00:00+08:00').toLocaleString('en-US', { timeZone: 'Asia/Manila' }));
-    }
-    const sched = getSchedule(uid, schedManila) || getSchedule(uid, manila);
-    const co    = cutoffMap[uid] || { hours:0, ot:0 };
-
-    let status = 'offline', label = 'Offline';
-    let elapsed = '', shiftStart = '', shiftEnd = '';
-    let shiftProgress = 0;
-
-    // Day override statuses
-    if (['holiday','absent','leave','vto'].includes(state.status)) {
-      const labelMap = { holiday:'Holiday 🎉', absent:'Absent', leave:'On Leave 🌴', vto:'VTO' };
-      status = state.status;
-      label  = labelMap[state.status];
-    } else if (sched) {
-      const dateStr = getManilaDateStr(manila);
-      const win     = getShiftWindow(sched, dateStr);
-      shiftStart    = fmtTime(win.start);
-      shiftEnd      = fmtTime(win.end);
-
-      // Shift progress percentage
-      const totalShiftMs  = win.end - win.start;
-      const elapsedShiftMs = Math.min(Math.max(0, now - win.start), totalShiftMs);
-      shiftProgress = Math.round((elapsedShiftMs / totalShiftMs) * 100);
-
-      if (state.status === 'out') {
-        status = (now >= win.start && now <= win.end) ? 'missing' : 'offline';
-        label  = status === 'missing' ? 'Missing' : 'Offline';
-      } else if (state.status === 'pre-shift') {
-        // Auto-promote if shift has started
-        if (state.shiftStart && now >= new Date(state.shiftStart)) {
-          state.status = 'in';
-          setState(uid, state);
-          status = 'active'; label = 'Active';
-        } else {
-          status = 'pre-shift'; label = 'Pre-Shift';
-        }
-        if (state.loginTime) elapsed = minsBetween(new Date(state.loginTime), now) + 'm';
-      } else if (state.status === 'in') {
-        const isOverbreak = (state.overbreakMs||0) > 0 || (state.overlunchMs||0) > 0;
-        status = state.isLate ? 'late' : (isOverbreak ? 'overbreak' : 'active');
-        label  = state.isLate ? 'Active — Late In' : (isOverbreak ? 'Active — Overbreak' : 'Active');
-        if (state.loginTime) elapsed = minsBetween(new Date(state.loginTime), now) + 'm';
-      } else {
-        const bl = {'15':'15-min Break','30':'30-min Break','lunch':'Lunch','bbl':'BBL'};
-        const bs = {'15':'break','30':'break','lunch':'lunch','bbl':'bbl'};
-        status  = bs[state.status] || 'break';
-        label   = bl[state.status] || 'Break';
-        if (state.breakStart) elapsed = minsBetween(new Date(state.breakStart), now) + 'm';
-      }
-    } else {
-      label = 'Day Off';
-    }
-
-    const coDates = getCutoffDates(entry.role);
-
-    users.push({
-      id: uid, name: entry.name, role: entry.role,
-      status, statusLabel: label,
-      shiftStart, shiftEnd, elapsed, shiftProgress,
-      runningHours: entry.role === 'Leader' ? Math.min(co.hours, LEADER_MAX_HRS) : co.hours,
-      otHours: entry.role === 'Leader' ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - co.hours)) : co.ot,
-      loginTime: state.loginTime ? fmtTime(new Date(state.loginTime)) : '',
-      breakUsed: state.breakUsed || 0, bblUsed: state.bblUsed || false,
-      cutoffEnd: fmtDate(coDates.end),
-      isLate: state.isLate || false,
-      lateMs: state.lateMs || 0,
-    });
+    const state = await getState(uid); const mem = await getCutoffMemory(uid);
+    users.push({ name: entry.name, status: state.status, hours: mem.hours });
   }
-
-  // Sort: Bad statuses first, then by role
-  const statusOrder = {
-    missing:   0,
-    absent:    1,
-    overbreak: 2,
-    late:      3,
-    break:     4,
-    lunch:     5,
-    bbl:       6,
-    active:    7,
-    'pre-shift': 8,
-    holiday:   9,
-    leave:     10,
-    vto:       11,
-    offset:    12,
-    offline:   13,
-  };
-  const roleOrder = { Leader:0, UYP:1, VA:2 };
-
-  users.sort((a, b) => {
-    const sA = statusOrder[a.status] ?? 13;
-    const sB = statusOrder[b.status] ?? 13;
-    if (sA !== sB) return sA - sB;
-    return (roleOrder[a.role]??3) - (roleOrder[b.role]??3);
-  });
-
-  const vaCo = getCutoffDates('VA');
-  return {
-    timestamp:   fmtTime(now),
-    date:        fmtDate(now),
-    manilaTime:  manila.toLocaleString('en-US'),
-    cutoffStart: fmtDate(vaCo.start),
-    cutoffEnd:   fmtDate(vaCo.end),
-    users,
-  };
-}
-
-// ============================================================
-// SET STATES — GET /set-states (run once to set everyone as logged in)
-// ============================================================
-app.get('/set-states', (req, res) => {
-  try {
-    const manila = manilaTime();
-    const dateStr = getManilaDateStr(manila);
-
-    // Define login times per user (Manila time)
-    const logins = [
-      // 12:00 AM shift — logged in at 11:45 PM May 8
-      { uid:'8044736892', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'7240390530', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'7830367843', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'2018117745', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'7207758648', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'8070441816', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'7514392042', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'5685031197', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'6132223983', loginHour:23, loginMin:45, prevDay:true },
-      { uid:'6088627916', loginHour:23, loginMin:45, prevDay:true },
-      // Cha - 12 AM shift, Mon-Thu (today is Fri so day off - skip)
-      // Alexis - 12 AM shift, Wed-Sun (works today Fri)
-      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
-      // 8:00 PM shift — Queency
-      { uid:'2009869833', loginHour:20, loginMin:0,  prevDay:true },
-      // 9:00 PM shifts
-      { uid:'7831137596', loginHour:21, loginMin:0,  prevDay:true },
-      { uid:'1802251672', loginHour:21, loginMin:0,  prevDay:true },
-      { uid:'8393347347', loginHour:21, loginMin:0,  prevDay:true },
-      { uid:'5359971666', loginHour:21, loginMin:0,  prevDay:true },
-      { uid:'6012486581', loginHour:21, loginMin:0,  prevDay:true },
-      { uid:'5660256653', loginHour:21, loginMin:0,  prevDay:true },
-    ];
-
-    const now = new Date();
-    // Get yesterday's date string
-    const yesterday = new Date(now.getTime() - 86400000);
-    const yDateStr = getManilaDateStr(yesterday);
-
-    let count = 0;
-    const set = new Set();
-
-    for (const u of logins) {
-      if (set.has(u.uid)) continue; // skip duplicates
-      set.add(u.uid);
-
-      const entry = ROSTER[u.uid];
-      if (!entry) continue;
-
-      const shiftDateStr = u.prevDay ? yDateStr : dateStr;
-      const loginDateStr = u.prevDay ? yDateStr : dateStr;
-      const loginTime = new Date(`${loginDateStr}T${String(u.loginHour).padStart(2,'0')}:${String(u.loginMin).padStart(2,'0')}:00+08:00`);
-      const win = getShiftWindow(entry, shiftDateStr);
-
-      setState(u.uid, {
-        status:      'out',
-        loginTime:   loginTime.toISOString(),
-        shiftDate:   shiftDateStr,
-        shiftStart:  win.start.toISOString(),
-        breakUsed:   0,
-        bblUsed:     false,
-        lunchUsed:   false,
-        lunchUsedMs: 0,
-        overbreakMs: 0,
-        overlunchMs: 0,
-        breakStart:  null,
-        breakType:   null,
-        isLate:      false,
-        lateMs:      0,
-      });
-      count++;
-    }
-
-    res.json({ ok:true, statesSet: count });
-  } catch(e) {
-    res.json({ ok:false, error: e.message });
-  }
+  res.json({ time: fmtTime(now), users });
 });
 
-// ============================================================
-// ADMIN ENDPOINTS
-// ============================================================
-
-// Reset all user states (call before each shift)
-app.get('/reset-states', (req, res) => {
-  const keys = Object.keys(STATE);
-  keys.forEach(k => delete STATE[k]);
-  console.log(`Reset ${keys.length} user states`);
-  res.json({ ok: true, cleared: keys.length });
+app.get('/reset-states', async (req, res) => {
+    const keys = await redisClient.keys('state:*');
+    if (keys.length > 0) await redisClient.del(keys);
+    res.json({ ok: true, cleared: keys.length });
 });
 
-// Full shift reset (states + re-register webhook)
-app.get('/shift-reset', async (req, res) => {
-  try {
-    // Clear all states
-    const keys = Object.keys(STATE);
-    keys.forEach(k => delete STATE[k]);
+app.get('/', (req, res) => res.json({ status:'ok', version:'2.0-Redis' }));
 
-    // Re-register webhook with drop_pending
-    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
-      url: `${WEBHOOK_URL}/webhook`,
-      drop_pending_updates: true,
-    });
-
-    console.log(`Shift reset: cleared ${keys.length} states, webhook refreshed`);
-    res.json({ ok: true, cleared: keys.length, webhook: 'refreshed' });
-  } catch(e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-app.get('/', (req, res) => res.json({ status:'ok', bot:'10X VAs v2.0', time: new Date().toISOString() }));
-
-// ============================================================
-// SEED CUTOFF — GET /seed-cutoff (run once)
-// ============================================================
-app.get('/seed-cutoff', async (req, res) => {
-  try {
-    const now = new Date();
-    const seed = [
-      // 5 shifts completed as of May 9
-      // Leaders: 40h base + cumulative OT (Bert:6, Moon:7, Nell:3.5, Gab:2)
-      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
-      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
-      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 40.0,  6.5, fmtTime(now)],
-      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 40.0,  3.0, fmtTime(now)],
-      // VAs: 5 shifts x 8h = 40h (Noreen had 1 absent = 32h)
-      ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['1802251672','Lovely', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['8393347347','Mary',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['5359971666','Pam',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['6012486581','Cris',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['5660256653','Jude',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['7207758648','Noreen', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
-      ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
-      // UYP: 5 shifts x 8h = 40h (Kat had 1 absent = 32h)
-      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
-      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
-      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
-    ];
-
-    // Clear existing data first
-    const token = await getGoogleToken();
-    if (token) {
-      await axios.put(
-        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent("'Cutoff Counter'!A2:H100")}`,
-        { values: Array(99).fill(Array(8).fill('')) },
-        { params: { valueInputOption: 'USER_ENTERED' }, headers: { Authorization: `Bearer ${token}` } }
-      );
-    }
-
-    // Write seed data to sheet
-    await sheetsAppend("'Cutoff Counter'!A:H", seed);
-
-    // Also populate in-memory CUTOFF
-    for (const r of seed) {
-      CUTOFF[r[0]] = { hours: parseFloat(r[5]) || 0, ot: parseFloat(r[6]) || 0 };
-    }
-
-    res.json({ ok: true, seeded: seed.length });
-  } catch(e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-// ============================================================
-// START
-// ============================================================
 app.listen(PORT, async () => {
-  console.log(`10X VAs bot v2.0 running on port ${PORT}`);
+  console.log(`Bot running on port ${PORT}`);
   try {
-    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
-      url: `${WEBHOOK_URL}/webhook`,
-      drop_pending_updates: true,
-    });
-    console.log('Webhook registered:', WEBHOOK_URL);
-  } catch(e) {
-    console.error('Webhook registration failed:', e.message);
-  }
-  // Init user log column map
-  if (SHEET_ID) initUserLogMap().catch(console.error);
+    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, { url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true });
+  } catch(e) { console.error('Webhook failed:', e.message); }
+  initUserLogMap().catch(console.error);
 });

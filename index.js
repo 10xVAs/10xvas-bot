@@ -1154,7 +1154,7 @@ app.get('/set-states', (req, res) => {
       const win = getShiftWindow(entry, shiftDateStr);
 
       setState(u.uid, {
-        status:      'in',
+        status:      'out',
         loginTime:   loginTime.toISOString(),
         shiftDate:   shiftDateStr,
         shiftStart:  win.start.toISOString(),

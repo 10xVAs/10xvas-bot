@@ -676,3 +676,29 @@ app.listen(PORT, async () => {
   } catch(e) { console.error('Webhook failed:', e.message); }
   initUserLogMap().catch(console.error);
 });
+app.get('/manual-fix-alexis', async (req, res) => {
+  try {
+    const alexisId = '7148499363';
+    const alexisData = {
+      status: "in",
+      loginTime: "2026-05-09T16:00:00.000Z",
+      shiftDate: "2026-05-10",
+      shiftStart: "2026-05-09T16:00:00.000Z",
+      breakUsed: 0,
+      bblUsed: false,
+      lunchUsed: false,
+      lunchUsedMs: 0,
+      overbreakMs: 0,
+      overlunchMs: 0,
+      breakStart: null,
+      breakType: null,
+      isLate: false,
+      lateMs: 0
+    };
+    
+    await redisClient.set(`state:${alexisId}`, JSON.stringify(alexisData));
+    res.send("<h1>Success! Alexis is back in the system.</h1>");
+  } catch (err) {
+    res.send("Error: " + err.message);
+  }
+});

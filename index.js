@@ -676,28 +676,50 @@ app.listen(PORT, async () => {
   } catch(e) { console.error('Webhook failed:', e.message); }
   initUserLogMap().catch(console.error);
 });
-app.get('/manual-fix-alexis', async (req, res) => {
+app.get('/emergency-fix', async (req, res) => {
   try {
+    const now = new Date();
+    // 1. First, fix the Cutoff Totals so the dashboard has numbers to show
+    const seed = [
+      ['8044736892','Bert',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
+      ['7240390530','Moon',   'Leader','May 2, 2026','May 16, 2026', 40.0, 10.0, fmtTime(now)],
+      ['7830367843','Nell',   'Leader','May 2, 2026','May 16, 2026', 40.0,  6.5, fmtTime(now)],
+      ['2018117745','Gab',    'Leader','May 2, 2026','May 16, 2026', 40.0,  3.0, fmtTime(now)],
+      ['2009869833','Queency','VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7831137596','Maku',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['1802251672','Lovely', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['8393347347','Mary',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['5359971666','Pam',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['6012486581','Cris',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['5660256653','Jude',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7207758648','Noreen', 'VA',    'May 2, 2026','May 16, 2026', 32.0, 0,    fmtTime(now)],
+      ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
+      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
+      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
+    ];
+
+    for (const r of seed) {
+      await setCutoffMemory(r[0], { hours: parseFloat(r[5]), ot: parseFloat(r[6]) });
+    }
+
+    // 2. Second, put Alexis back in her shift
     const alexisId = '7148499363';
     const alexisData = {
       status: "in",
       loginTime: "2026-05-09T16:00:00.000Z",
       shiftDate: "2026-05-10",
       shiftStart: "2026-05-09T16:00:00.000Z",
-      breakUsed: 0,
-      bblUsed: false,
-      lunchUsed: false,
-      lunchUsedMs: 0,
-      overbreakMs: 0,
-      overlunchMs: 0,
-      breakStart: null,
-      breakType: null,
-      isLate: false,
-      lateMs: 0
+      breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+      overbreakMs: 0, overlunchMs: 0, breakStart: null, breakType: null,
+      isLate: false, lateMs: 0
     };
-    
-    await redisClient.set(`state:${alexisId}`, JSON.stringify(alexisData));
-    res.send("<h1>Success! Alexis is back in the system.</h1>");
+    await setState(alexisId, alexisData);
+
+    res.send("<h1>System Re-Seeded and Alexis Fixed! Dashboard should load now.</h1>");
   } catch (err) {
     res.send("Error: " + err.message);
   }

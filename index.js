@@ -1242,9 +1242,9 @@ app.get('/seed-cutoff', async (req, res) => {
       ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
       ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
       // UYP: 5 shifts x 8h = 40h (Kat had 1 absent = 32h)
-      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 32.0, 0,    fmtTime(now)],
-      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
-      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
+      ['5685031197','Kat',    'UYP',   'May 1, 2026','May 15, 2026', 40.0, 0,    fmtTime(now)],
+      ['6132223983','Yuqi',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
+      ['6088627916','Nina',   'UYP',   'May 1, 2026','May 15, 2026', 48.0, 0,    fmtTime(now)],
     ];
 
     // Clear existing data first

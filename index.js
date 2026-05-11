@@ -2218,9 +2218,9 @@ app.get('/set-states', (req, res) => {
 
       // 12:00 AM shift — logged in at 12:00 PM May 12
 
-      { uid:'8044736892', loginHour:23, loginMin:45, prevDay:false },
+      { uid:'8044736892', loginHour:00, loginMin:00, prevDay:false },
 
-      { uid:'7240390530', loginHour:23, loginMin:45, prevDay:false },
+      { uid:'7240390530', loginHour:00, loginMin:00, prevDay:true },
 
       { uid:'7830367843', loginHour:23, loginMin:45, prevDay:false },
 

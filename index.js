@@ -2216,29 +2216,29 @@ app.get('/set-states', (req, res) => {
 
     const logins = [
 
-      // 12:00 AM shift — logged in at 11:45 PM May 8
+      // 12:00 AM shift — logged in at 12:00 PM May 12
 
-      { uid:'8044736892', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'8044736892', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'7240390530', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7240390530', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'7830367843', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7830367843', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'2018117745', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'2018117745', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'7207758648', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7207758648', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'8070441816', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'8070441816', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'7514392042', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'7514392042', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'5685031197', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'5685031197', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'6132223983', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'6132223983', loginHour:23, loginMin:45, prevDay:false },
 
-      { uid:'6088627916', loginHour:23, loginMin:45, prevDay:true },
+      { uid:'6088627916', loginHour:23, loginMin:45, prevDay:false },
 
       // Cha - 12 AM shift, Mon-Thu (today is Fri so day off - skip)
 

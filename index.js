@@ -2310,7 +2310,7 @@ app.get('/set-states', (req, res) => {
 
       setState(u.uid, {
 
-        status:      'out',
+        status:      'in',
 
         loginTime:   loginTime.toISOString(),
 

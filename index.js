@@ -78,7 +78,10 @@ const ROSTER = {
 
   '5359971666': { name:'Pam',     role:'VA',     days:[1,1,1,1,1,0,0], start:'9:00 PM',  end:'5:00 AM' },
 
-  '6012486581': { name:'Cris',    role:'VA',     days:[1,1,1,1,1,0,0], start:'9:00 PM',  end:'5:00 AM' },
+  '6012486581': [
+  { name:'Cris', role:'VA', days:[1,1,1,1,0,0,0], start:'9:00 PM',  end:'5:00 AM' },
+  { name:'Cris', role:'VA', days:[0,0,0,0,1,0,0], start:'11:00 PM', end:'7:00 AM' },
+],
 
   '5660256653': { name:'Jude',    role:'VA',     days:[1,1,1,1,1,0,0], start:'9:00 PM',  end:'6:00 AM' },
 
@@ -86,7 +89,10 @@ const ROSTER = {
 
   '8070441816': { name:'John',    role:'VA',     days:[0,1,1,1,1,1,0], start:'12:00 AM', end:'9:00 AM' },
 
-  '6705167382': { name:'Cha',     role:'VA',     days:[1,1,1,1,0,0,1], start:'12:00 AM', end:'9:00 AM' },
+  '6705167382': [
+  { name:'Cha', role:'VA', days:[1,1,1,1,0,0,0], start:'12:00 AM', end:'9:00 AM' },
+  { name:'Cha', role:'VA', days:[0,0,0,0,0,0,1], start:'2:00 AM',  end:'9:00 AM' },
+],
 
   '7148499363': { name:'Alexis',  role:'VA',     days:[0,0,1,1,1,1,1], start:'12:00 AM', end:'9:00 AM' },
 
@@ -229,15 +235,18 @@ function getShiftWindow(sched, dateStr) {
 function getSchedule(uid, manila) {
 
   const r = ROSTER[uid];
-
   if (!r) return null;
 
   const dow = manila.getDay();
-
   const idx = dow === 0 ? 6 : dow - 1;
 
-  return r.days[idx] ? r : null;
+  // Dynamic schedules (Cha / Cris)
+  if (Array.isArray(r)) {
+    return r.find(s => s.days[idx]) || null;
+  }
 
+  // Standard schedules
+  return r.days[idx] ? r : null;
 }
 
 
@@ -1692,24 +1701,28 @@ async function handleSched(uid, name) {
 
   const entry = ROSTER[uid];
 
-  if (!entry) return `⚠️ ${name}, no schedule found.`;
+  if (!entry) {
+    return `⚠️ ${name}, no schedule found.`;
+  }
 
-
+  const schedules = Array.isArray(entry)
+    ? entry
+    : [entry];
 
   const days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 
-  const workDays = days.filter((d,i) => entry.days[i]);
+  let msg = `📅 <b>Schedule — ${name}</b>\n`;
+  msg += `Role: <b>${schedules[0].role}</b>\n`;
 
+  for (const sched of schedules) {
 
+    const workDays = days.filter((d, i) => sched.days[i]);
 
-  return `📅 <b>Schedule — ${name}</b>\n` +
+    msg += `\n<b>${sched.start} – ${sched.end}</b>\n`;
+    msg += `${workDays.join(', ')}\n`;
+  }
 
-    `Role: <b>${entry.role}</b>\n` +
-
-    `Days: <b>${workDays.join(', ')}</b>\n` +
-
-    `Shift: <b>${entry.start} – ${entry.end}</b>`;
-
+  return msg;
 }
 
 
@@ -2197,163 +2210,77 @@ async function getDashboardData() {
 
 
 // ============================================================
-
-// SET STATES — GET /set-states (run once to set everyone as logged in)
-
+// SET STATES — SAFE RECOVERY MODE
+// Only restores users whose shifts are ACTIVE right now
 // ============================================================
 
 app.get('/set-states', (req, res) => {
-
   try {
 
-    const manila = manilaTime();
-
-    const dateStr = getManilaDateStr(manila);
-
-
-
-    // Define login times per user (Manila time)
-
-    const logins = [
-
-      // 12:00 AM shift — logged in at 12:00 PM May 12
-
-      { uid:'8044736892', loginHour:00, loginMin:00, prevDay:false },
-
-      { uid:'7240390530', loginHour:00, loginMin:00, prevDay:true },
-
-      { uid:'7830367843', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'2018117745', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'7207758648', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'8070441816', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'7514392042', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'5685031197', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'6132223983', loginHour:23, loginMin:45, prevDay:false },
-
-      { uid:'6088627916', loginHour:23, loginMin:45, prevDay:false },
-
-      // Cha - 12 AM shift, Mon-Thu (today is Fri so day off - skip)
-
-      // Alexis - 12 AM shift, Wed-Sun (works today Fri)
-
-      { uid:'7148499363', loginHour:23, loginMin:45, prevDay:true },
-
-      // 8:00 PM shift — Queency
-
-      { uid:'2009869833', loginHour:20, loginMin:0,  prevDay:true },
-
-      // 9:00 PM shifts
-
-      { uid:'7831137596', loginHour:21, loginMin:0,  prevDay:true },
-
-      { uid:'1802251672', loginHour:21, loginMin:0,  prevDay:true },
-
-      { uid:'8393347347', loginHour:21, loginMin:0,  prevDay:true },
-
-      { uid:'5359971666', loginHour:21, loginMin:0,  prevDay:true },
-
-      { uid:'6012486581', loginHour:21, loginMin:0,  prevDay:true },
-
-      { uid:'5660256653', loginHour:21, loginMin:0,  prevDay:true },
-
-    ];
-
-
-
-    const now = new Date();
-
-    // Get yesterday's date string
-
-    const yesterday = new Date(now.getTime() - 86400000);
-
-    const yDateStr = getManilaDateStr(yesterday);
-
-
+    const now    = manilaTime();
+    const today  = getManilaDateStr(now);
 
     let count = 0;
+    const skipped = [];
 
-    const set = new Set();
+    for (const [uid, entry] of Object.entries(ROSTER)) {
 
+      // Skip if no schedule today
+      const sched = getSchedule(uid, now);
+      if (!sched) {
+        skipped.push(`${entry.name} (day off)`);
+        continue;
+      }
 
+      const win = getShiftWindow(sched, today);
 
-    for (const u of logins) {
+      // Fail-safe:
+      // Only restore if NOW is inside shift window
+      if (now < win.start || now > win.end) {
+        skipped.push(`${entry.name} (outside shift)`);
+        continue;
+      }
 
-      if (set.has(u.uid)) continue; // skip duplicates
-
-      set.add(u.uid);
-
-
-
-      const entry = ROSTER[u.uid];
-
-      if (!entry) continue;
-
-
-
-      const shiftDateStr = u.prevDay ? yDateStr : dateStr;
-
-      const loginDateStr = u.prevDay ? yDateStr : dateStr;
-
-      const loginTime = new Date(`${loginDateStr}T${String(u.loginHour).padStart(2,'0')}:${String(u.loginMin).padStart(2,'0')}:00+08:00`);
-
-      const win = getShiftWindow(entry, shiftDateStr);
-
-
-
-      setState(u.uid, {
-
+      setState(uid, {
         status:      'in',
-
-        loginTime:   loginTime.toISOString(),
-
-        shiftDate:   shiftDateStr,
-
+        loginTime:   win.start.toISOString(), // assumes on-time
+        shiftDate:   today,
         shiftStart:  win.start.toISOString(),
 
         breakUsed:   0,
-
         bblUsed:     false,
-
         lunchUsed:   false,
-
         lunchUsedMs: 0,
 
         overbreakMs: 0,
-
         overlunchMs: 0,
 
         breakStart:  null,
-
         breakType:   null,
 
         isLate:      false,
-
         lateMs:      0,
-
       });
 
       count++;
-
     }
 
+    console.log(`Safe restore: ${count} users restored`);
 
-
-    res.json({ ok:true, statesSet: count });
+    res.json({
+      ok: true,
+      restored: count,
+      skipped,
+    });
 
   } catch(e) {
 
-    res.json({ ok:false, error: e.message });
+    res.json({
+      ok:false,
+      error:e.message
+    });
 
   }
-
 });
 
 
@@ -2446,7 +2373,7 @@ app.get('/seed-cutoff', async (req, res) => {
 
     const seed = [
 
-      // 5 shifts completed as of May 9
+      // 5 shifts completed as of May 11
 
       // Leaders: 40h base + cumulative OT (Bert:6, Moon:7, Nell:3.5, Gab:2)
 
@@ -2478,9 +2405,9 @@ app.get('/seed-cutoff', async (req, res) => {
 
       ['8070441816','John',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
 
-      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['6705167382','Cha',    'VA',    'May 2, 2026','May 16, 2026', 48.0, 0,    fmtTime(now)],
 
-      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
+      ['7148499363','Alexis', 'VA',    'May 2, 2026','May 16, 2026', 48.0, 0,    fmtTime(now)],
 
       ['7514392042','Kate',   'VA',    'May 2, 2026','May 16, 2026', 40.0, 0,    fmtTime(now)],
 

@@ -1,14 +1,12 @@
 {
   "name": "10xvas-bot",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "10X VAs Telegram Time Tracking Bot",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.0",
-    "redis": "^4.6.10"
+    "redis": "^4.6.0"
   }
 }

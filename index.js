@@ -1023,6 +1023,96 @@ app.get('/shift-reset', async (req, res) => {
 });
 
 // ============================================================
+// SCHEDULER — daily reset + cutoff reset
+// ============================================================
+
+function getManilaHHMM() {
+  const now = new Date();
+  const manila = new Date(now.toLocaleString('en-US', { timeZone:'Asia/Manila' }));
+  return { h: manila.getHours(), m: manila.getMinutes(), dateStr: getManilaDateStr(manila) };
+}
+
+async function runDailyReset() {
+  console.log('[Scheduler] Running daily reset (6PM Manila)');
+  try {
+    const keys = await redisKeys('state:*');
+    for (const key of keys) {
+      await redisDel(key);
+    }
+    console.log(`[Scheduler] Daily reset: cleared ${keys.length} states`);
+
+    // Re-register webhook with drop_pending
+    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+      url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
+    });
+    console.log('[Scheduler] Webhook refreshed');
+  } catch(e) { console.error('[Scheduler] Daily reset error:', e.message); }
+}
+
+async function runCutoffReset() {
+  console.log('[Scheduler] Running cutoff reset (9AM Manila)');
+  try {
+    const roster = await getRoster();
+
+    for (const user of roster) {
+      // Check if today is the last day of their cutoff
+      if (!isLastCutoffDay(user.role)) continue;
+
+      // Reset cutoff hours to 0
+      await resetCutoffForUser(user.id);
+      console.log(`[Scheduler] Reset cutoff for ${user.name} (${user.role})`);
+    }
+
+    // Also clear all states at cutoff reset
+    const keys = await redisKeys('state:*');
+    for (const key of keys) await redisDel(key);
+    console.log(`[Scheduler] Cutoff reset: cleared ${keys.length} states`);
+
+    // Refresh webhook
+    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+      url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
+    });
+    console.log('[Scheduler] Cutoff reset complete');
+  } catch(e) { console.error('[Scheduler] Cutoff reset error:', e.message); }
+}
+
+// Track last run dates to avoid double-firing
+let lastDailyReset   = '';
+let lastCutoffReset  = '';
+
+// Run every minute — check if it's time to fire
+setInterval(async () => {
+  try {
+    const { h, m, dateStr } = getManilaHHMM();
+
+    // Daily reset: 6:00 PM Manila (18:00) — skip on cutoff reset days
+    if (h === 18 && m === 0 && lastDailyReset !== dateStr) {
+      const roster = await getRoster();
+      // Only run daily reset if today is NOT the last cutoff day for any group
+      // (cutoff reset takes precedence and handles state clearing)
+      const isCutoffDay = roster.some(u => isLastCutoffDay(u.role));
+      if (!isCutoffDay) {
+        lastDailyReset = dateStr;
+        await runDailyReset();
+      } else {
+        console.log('[Scheduler] Skipping daily reset — cutoff day takes precedence');
+        lastDailyReset = dateStr;
+      }
+    }
+
+    // Cutoff reset: 9:00 AM Manila (09:00)
+    if (h === 9 && m === 0 && lastCutoffReset !== dateStr) {
+      const roster = await getRoster();
+      const hasCutoffToday = roster.some(u => isLastCutoffDay(u.role));
+      if (hasCutoffToday) {
+        lastCutoffReset = dateStr;
+        await runCutoffReset();
+      }
+    }
+  } catch(e) { console.error('[Scheduler] Tick error:', e.message); }
+}, 60 * 1000); // check every 60 seconds
+
+// ============================================================
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => res.json({

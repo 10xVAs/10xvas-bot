@@ -333,8 +333,9 @@ function calcPayable(user, state, logoutTime) {
 
     const shiftMins = minsBetween(win.start, win.end);
     const hasLunch  = shiftMins >= 510;
+    // Always use lunchUsedMs — stores actual time taken (set correctly on /back)
     let lunchMs = 0;
-    if (hasLunch) lunchMs = state.bblUsed ? LUNCH_MINS*60000 : (state.lunchUsedMs||0);
+    if (hasLunch) lunchMs = state.lunchUsedMs || 0;
 
     let netMs = Math.max(0, grossMs - lunchMs - (state.overbreakMs||0) - (state.overlunchMs||0) - lateMs);
     let hours = netMs / 3600000;
@@ -590,8 +591,19 @@ async function handleBack(uid, name) {
 
   if (bt==='15')    state.breakUsed = (state.breakUsed||0) + 15;
   if (bt==='30')    state.breakUsed = (state.breakUsed||0) + 30;
-  if (bt==='bbl')   { state.bblUsed=true; state.lunchUsedMs=LUNCH_MINS*60000; state.lunchUsed=true; }
-  if (bt==='lunch') { state.lunchUsed=true; state.lunchUsedMs=LUNCH_MINS*60000; }
+  if (bt==='bbl') {
+    // Actual lunch portion = actual BBL time minus the 30-min break, capped at LUNCH_MINS
+    const actualLunchMins = Math.min(Math.max(0, actual - 30), LUNCH_MINS);
+    state.bblUsed     = true;
+    state.lunchUsed   = true;
+    state.lunchUsedMs = actualLunchMins * 60000;
+  }
+  if (bt==='lunch') {
+    // Actual lunch taken, capped at LUNCH_MINS (any overflow already captured in overlunchMs)
+    const actualLunchMins = Math.min(actual, LUNCH_MINS);
+    state.lunchUsed   = true;
+    state.lunchUsedMs = actualLunchMins * 60000;
+  }
 
   let overMsg = '';
   if (over > 0) {

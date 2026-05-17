@@ -6,7 +6,7 @@ const axios = require('axios');
 const TOKEN    = '8388439255:AAFqNnOaPoKJB2syNOpAWYjsciH9LDm61Tw';
 const CHAT_ID  = '-1002490554910';
 const TOPIC_ID = 27;
-const MINI_APP_URL = 'YOUR_GHL_URL_HERE'; // ← replace this
+const MINI_APP_URL = 'https://t.me/timestamp_10x_bot/timestamp_10xvas'; // ← replace this
 
 async function sendPinnedButton() {
   try {

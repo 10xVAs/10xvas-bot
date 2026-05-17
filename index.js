@@ -872,9 +872,34 @@ async function getDashboardData() {
       }
     } else { label='Day Off'; }
 
-    const coDates    = getCutoffDates(user.role);
-    const dispHours  = isLeader(user.role) ? Math.min(co.hours, LEADER_MAX_HRS) : co.hours;
-    const dispOT     = isLeader(user.role) ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - co.hours)) : co.ot;
+    const coDates = getCutoffDates(user.role);
+
+    // Real-time running hours: add current in-progress shift hours to stored total
+    let liveHours = co.hours;
+    if (state.loginTime && ['in','pre-shift','15','30','lunch','bbl'].includes(state.status)) {
+      try {
+        const dateStr2 = state.shiftDate || getManilaDateStr(manila);
+        const sched2   = getTodaySchedule(user, new Date(dateStr2 + 'T12:00:00+08:00'));
+        if (sched2) {
+          const win2     = getShiftWindow(sched2, dateStr2);
+          const login    = new Date(state.loginTime);
+          const effLogin = login > win2.start ? login : win2.start;
+          const effNow   = now < win2.end ? now : win2.end;
+          let grossMs    = Math.max(0, effNow - effLogin);
+          let lateMs     = Math.max(0, effLogin - win2.start);
+          if (lateMs <= GRACE_MINS * 60000) lateMs = 0;
+          const breakMs  = (state.overbreakMs||0) + (state.overlunchMs||0);
+          const lunchMs  = state.lunchUsedMs || 0;
+          let netMs      = Math.max(0, grossMs - lateMs - breakMs - lunchMs);
+          let liveShift  = netMs / 3600000;
+          if (!isLeader(user.role)) liveShift = Math.min(liveShift, MAX_SHIFT_HRS);
+          liveHours = Math.round((co.hours + liveShift) * 100) / 100;
+        }
+      } catch(e) {}
+    }
+
+    const dispHours = isLeader(user.role) ? Math.min(liveHours, LEADER_MAX_HRS) : liveHours;
+    const dispOT    = isLeader(user.role) ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - liveHours)) : co.ot;
 
     users.push({
       id:user.id, name:user.name, role:user.role,

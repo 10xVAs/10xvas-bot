@@ -1173,3 +1173,103 @@ app.listen(PORT, async () => {
     console.log('Webhook registered');
   } catch(e) { console.error('Webhook failed:', e.message); }
 });
+
+// ============================================================
+// MINI APP ENDPOINTS
+// ============================================================
+
+// GET /me/:uid — returns user state for the mini app
+app.get('/me/:uid', async (req, res) => {
+  const uid  = req.params.uid;
+  const user = await getUserById(uid);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const state  = await getState(uid);
+  const co     = await getCutoffHours(uid);
+  const manila = manilaTime();
+  const sched  = getTodaySchedule(user, manila);
+
+  // Shift window
+  let shiftStart = '', shiftEnd = '', shiftProgress = 0, hasLunch = false;
+  if (sched) {
+    const dateStr = state.shiftDate || getManilaDateStr(manila);
+    const win     = getShiftWindow(sched, dateStr);
+    shiftStart    = fmtTime(win.start);
+    shiftEnd      = fmtTime(win.end);
+    const totalMs = win.end - win.start;
+    const now     = new Date();
+    shiftProgress = Math.round(Math.min(100, Math.max(0, (now - win.start) / totalMs * 100)));
+    hasLunch      = minsBetween(win.start, win.end) >= 510;
+  }
+
+  // Live running hours
+  let liveHours = co.hours;
+  if (state.loginTime && ['in','pre-shift','15','30','lunch','bbl'].includes(state.status)) {
+    try {
+      const dateStr2 = state.shiftDate || getManilaDateStr(manila);
+      const sched2   = getTodaySchedule(user, new Date(dateStr2 + 'T12:00:00+08:00'));
+      if (sched2) {
+        const win2     = getShiftWindow(sched2, dateStr2);
+        const login    = new Date(state.loginTime);
+        const now      = new Date();
+        const effLogin = login > win2.start ? login : win2.start;
+        const effNow   = now < win2.end ? now : win2.end;
+        let grossMs    = Math.max(0, effNow - effLogin);
+        let lateMs     = Math.max(0, effLogin - win2.start);
+        if (lateMs <= GRACE_MINS * 60000) lateMs = 0;
+        const breakMs  = (state.overbreakMs||0) + (state.overlunchMs||0);
+        const lunchMs  = state.lunchUsedMs || 0;
+        let netMs      = Math.max(0, grossMs - lateMs - breakMs - lunchMs);
+        let liveShift  = netMs / 3600000;
+        if (!isLeader(user.role)) liveShift = Math.min(liveShift, MAX_SHIFT_HRS);
+        liveHours = Math.round((co.hours + liveShift) * 100) / 100;
+      }
+    } catch(e) {}
+  }
+
+  const coDates = getCutoffDates(user.role);
+
+  res.json({
+    id:           user.id,
+    name:         user.name,
+    role:         user.role,
+    state,
+    shiftStart,
+    shiftEnd,
+    shiftProgress,
+    hasLunch,
+    runningHours: liveHours,
+    otHours:      co.ot,
+    cutoffEnd:    fmtDate(coDates.end),
+  });
+});
+
+// POST /action — executes a command on behalf of the mini app user
+app.post('/action', async (req, res) => {
+  const { uid, action } = req.body;
+  if (!uid || !action) return res.status(400).json({ error: 'Missing uid or action' });
+
+  const user = await getUserById(uid);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const name = user.name;
+  let reply  = null;
+
+  try {
+    if      (action === 'in')     reply = await handleIn(uid, name);
+    else if (action === 'out')    reply = await handleOut(uid, name);
+    else if (action === 'back')   reply = await handleBack(uid, name);
+    else if (action === '15')     reply = await handleBreak(uid, name, '15');
+    else if (action === '30')     reply = await handleBreak(uid, name, '30');
+    else if (action === 'lunch')  reply = await handleBreak(uid, name, 'lunch');
+    else if (action === 'bbl')    reply = await handleBreak(uid, name, 'bbl');
+    else return res.status(400).json({ error: 'Unknown action' });
+
+    // Strip HTML tags for clean mini app messages
+    const clean = reply.replace(/<[^>]+>/g, '');
+    res.json({ ok: true, message: clean });
+  } catch(e) {
+    console.error('action endpoint:', e.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});

@@ -209,13 +209,91 @@ function getShiftWindow(sched, dateStr) {
   return { start, end };
 }
 
+// Returns the "shift window date string" for a given schedule on the day it should start.
+// Since shifts like 9PM-5AM start on Day N and end on Day N+1,
+// we use the start-of-shift date as the anchor.
+function getWindowForSched(sched, dateStr) {
+  return getShiftWindow(sched, dateStr);
+}
+
+// The 6PM Manila rule: our "day" runs from 6PM to 6PM.
+// Any time from 6PM onward belongs to the NEXT calendar day's shift window.
+// We search for the schedule that is currently active OR upcoming within this 6PM window.
 function getTodaySchedule(user, manila) {
-  const dow = manila.getDay(); // 0=Sun
-  const idx = dow === 0 ? 6 : dow - 1; // Mon=0...Sun=6
+  const now = new Date(); // actual UTC now
+  // Try today and tomorrow as candidate dates (Manila calendar dates)
+  const todayStr    = getManilaDateStr(manila);
+  const tomorrowStr = getManilaDateStr(new Date(manila.getTime() + 86400000));
+  const yesterdayStr = getManilaDateStr(new Date(manila.getTime() - 86400000));
+
+  // Build the 6PM window boundaries
+  const windowStart = new Date(`${todayStr}T18:00:00+08:00`);
+  // If before 6PM today, the current window started yesterday at 6PM
+  const isBeforeSixPM = now < windowStart;
+  const winStart = isBeforeSixPM
+    ? new Date(`${yesterdayStr}T18:00:00+08:00`)
+    : windowStart;
+  const winEnd = new Date(winStart.getTime() + 86400000); // +24h
+
+  // Check all schedules across today and tomorrow dates
+  // Find one whose shift window falls within or overlaps the current 6PM window
+  const candidates = [];
   for (const sched of (user.schedules || [])) {
-    if (sched.days[idx]) return sched;
+    for (const dateStr of [yesterdayStr, todayStr, tomorrowStr]) {
+      const shiftDate = new Date(dateStr + 'T12:00:00+08:00');
+      const dow = shiftDate.getDay();
+      const idx = dow === 0 ? 6 : dow - 1;
+      if (!sched.days[idx]) continue;
+      const win = getShiftWindow(sched, dateStr);
+      // This shift overlaps with the current 6PM window
+      if (win.end > winStart && win.start < winEnd) {
+        candidates.push({ sched, dateStr, win });
+      }
+    }
   }
-  return null;
+
+  if (!candidates.length) return null;
+  // Prefer the shift that is currently active (now is within window)
+  const active = candidates.find(c => now >= c.win.start && now <= c.win.end);
+  if (active) return active.sched;
+  // Otherwise return the next upcoming one
+  candidates.sort((a, b) => a.win.start - b.win.start);
+  return candidates[0].sched;
+}
+
+// Same as getTodaySchedule but also returns the correct dateStr for getShiftWindow
+function getTodayScheduleWithDate(user, manila) {
+  const now = new Date();
+  const todayStr     = getManilaDateStr(manila);
+  const tomorrowStr  = getManilaDateStr(new Date(manila.getTime() + 86400000));
+  const yesterdayStr = getManilaDateStr(new Date(manila.getTime() - 86400000));
+
+  const windowStart = new Date(`${todayStr}T18:00:00+08:00`);
+  const isBeforeSixPM = now < windowStart;
+  const winStart = isBeforeSixPM
+    ? new Date(`${yesterdayStr}T18:00:00+08:00`)
+    : windowStart;
+  const winEnd = new Date(winStart.getTime() + 86400000);
+
+  const candidates = [];
+  for (const sched of (user.schedules || [])) {
+    for (const dateStr of [yesterdayStr, todayStr, tomorrowStr]) {
+      const shiftDate = new Date(dateStr + 'T12:00:00+08:00');
+      const dow = shiftDate.getDay();
+      const idx = dow === 0 ? 6 : dow - 1;
+      if (!sched.days[idx]) continue;
+      const win = getShiftWindow(sched, dateStr);
+      if (win.end > winStart && win.start < winEnd) {
+        candidates.push({ sched, dateStr, win });
+      }
+    }
+  }
+
+  if (!candidates.length) return { sched: null, dateStr: todayStr };
+  const active = candidates.find(c => now >= c.win.start && now <= c.win.end);
+  if (active) return { sched: active.sched, dateStr: active.dateStr };
+  candidates.sort((a, b) => a.win.start - b.win.start);
+  return { sched: candidates[0].sched, dateStr: candidates[0].dateStr };
 }
 
 function isLeader(role) { return role === 'Leader'; }
@@ -310,14 +388,44 @@ async function resetCutoffForUser(uid) {
   await setCutoffHours(uid, { hours:0, ot:0 });
 }
 
+// ── SNAPSHOT OVERRIDES ── stored in Redis, synced to both panels
+async function getSnapshotOverrides() {
+  try {
+    const raw = await redisGet('snapshot_overrides');
+    return raw ? JSON.parse(raw) : {};
+  } catch(e) { return {}; }
+}
+async function setSnapshotOverride(uid, data) {
+  const ov = await getSnapshotOverrides();
+  ov[uid] = { ...data, ts: new Date().toISOString() };
+  await redisSet('snapshot_overrides', JSON.stringify(ov));
+}
+async function clearSnapshotOverride(uid) {
+  const ov = await getSnapshotOverrides();
+  delete ov[uid];
+  await redisSet('snapshot_overrides', JSON.stringify(ov));
+}
+async function clearAllSnapshotOverrides() {
+  await redisSet('snapshot_overrides', JSON.stringify({}));
+}
+
 // ============================================================
 // PAYABLE HOURS
 // ============================================================
 function calcPayable(user, state, logoutTime) {
   try {
-    const role     = user.role;
-    const login    = new Date(state.loginTime);
-    const logout   = logoutTime;
+    const role  = user.role;
+    const login = new Date(state.loginTime);
+    const logout = logoutTime;
+
+    // Leader logged in on day-off — all time counts as OT
+    if (state.leaderDayOff && isLeader(role)) {
+      const grossMs = Math.max(0, logout - login);
+      const lunchMs = state.lunchUsedMs || 0;
+      const netMs   = Math.max(0, grossMs - lunchMs - (state.overbreakMs||0) - (state.overlunchMs||0));
+      return { hours: 0, ot: Math.round((netMs / 3600000) * 100) / 100 };
+    }
+
     const shiftDay = state.shiftDate || getManilaDateStr(manilaTime());
     const sched    = user.schedules.find(s => s.days[[6,0,1,2,3,4,5][new Date(shiftDay + 'T12:00:00+08:00').getDay()]]);
     if (!sched) return { hours:0, ot:0 };
@@ -333,13 +441,11 @@ function calcPayable(user, state, logoutTime) {
 
     const shiftMins = minsBetween(win.start, win.end);
     const hasLunch  = shiftMins >= 510;
-    // Always use lunchUsedMs — stores actual time taken (set correctly on /back)
     let lunchMs = 0;
     if (hasLunch) lunchMs = state.lunchUsedMs || 0;
 
     let netMs = Math.max(0, grossMs - lunchMs - (state.overbreakMs||0) - (state.overlunchMs||0) - lateMs);
     let hours = netMs / 3600000;
-
     if (!isLeader(role)) hours = Math.min(hours, MAX_SHIFT_HRS);
 
     let ot = 0;
@@ -430,43 +536,44 @@ async function handleIn(uid, name) {
 
   if (!user) return `🚫 Unauthorized user. Please contact your admin or supervisor.`;
 
-  // Already active (not out, not day-override)
   const dayOverrides = ['holiday','absent','leave','vto'];
   if (state.status !== 'out' && !dayOverrides.includes(state.status)) {
     return `⚠️ You're already logged in, ${name}. If this is an error, please contact your supervisor.`;
   }
 
-  const sched = getTodaySchedule(user, manila);
-  if (!sched) {
+  const { sched, dateStr } = getTodayScheduleWithDate(user, manila);
+
+  // Leaders can log in on any day including day-offs (treated as OT)
+  if (!sched && !isLeader(user.role)) {
     return `📋 Hi ${name}! Today doesn't appear to be a scheduled workday for you. If you think this is an error, please reach out to your supervisor.`;
   }
 
-  const dateStr      = getManilaDateStr(manila);
-  const win          = getShiftWindow(sched, dateStr);
-  const minsToShift  = minsBetween(now, win.start);
-  const minsLate     = minsBetween(win.start, now);
-  const isVeryEarly  = minsToShift > EARLY_LIMIT;
-  const isSlightEarly = minsToShift > 0 && minsToShift <= EARLY_LIMIT;
-  const isLate       = minsLate > GRACE_MINS;
+  if (!sched && isLeader(user.role)) {
+    await setState(uid, {
+      status: 'in', loginTime: now.toISOString(),
+      shiftDate: dateStr, shiftStart: null,
+      breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+      overbreakMs: 0, overlunchMs: 0, breakStart: null, breakType: null,
+      isLate: false, lateMs: 0, leaderDayOff: true,
+    });
+    logToSheet(uid, name, 'in', now).catch(console.error);
+    return `✅ Log In confirmed — ${name}. Flexible OT session started. Have a great shift! 💪`;
+  }
 
-  // Leaders don't get pre-shift tagged
-  const newStatus = (isVeryEarly || isSlightEarly) && !isLeader(user.role) ? 'pre-shift' : 'in';
+  const win           = getShiftWindow(sched, dateStr);
+  const minsToShift   = minsBetween(now, win.start);
+  const minsLate      = minsBetween(win.start, now);
+  const isVeryEarly   = minsToShift > EARLY_LIMIT;
+  const isSlightEarly = minsToShift > 0 && minsToShift <= EARLY_LIMIT;
+  const isLate        = minsLate > GRACE_MINS;
+  const newStatus     = (isVeryEarly || isSlightEarly) && !isLeader(user.role) ? 'pre-shift' : 'in';
 
   await setState(uid, {
-    status:      newStatus,
-    loginTime:   now.toISOString(),
-    shiftDate:   dateStr,
-    shiftStart:  win.start.toISOString(),
-    breakUsed:   0,
-    bblUsed:     false,
-    lunchUsed:   false,
-    lunchUsedMs: 0,
-    overbreakMs: 0,
-    overlunchMs: 0,
-    breakStart:  null,
-    breakType:   null,
-    isLate:      isLate,
-    lateMs:      isLate ? minsLate * 60000 : 0,
+    status: newStatus, loginTime: now.toISOString(),
+    shiftDate: dateStr, shiftStart: win.start.toISOString(),
+    breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+    overbreakMs: 0, overlunchMs: 0, breakStart: null, breakType: null,
+    isLate, lateMs: isLate ? minsLate * 60000 : 0, leaderDayOff: false,
   });
 
   logToSheet(uid, name, 'in', now).catch(console.error);
@@ -834,10 +941,11 @@ app.get('/dashboard', async (req, res) => {
 });
 
 async function getDashboardData() {
-  const now    = new Date();
-  const manila = manilaTime();
-  const roster = await getRoster();
-  const users  = [];
+  const now               = new Date();
+  const manila            = manilaTime();
+  const roster            = await getRoster();
+  const snapshotOverrides = await getSnapshotOverrides();
+  const users             = [];
 
   for (const user of roster) {
     const state = await getState(user.id);
@@ -913,6 +1021,13 @@ async function getDashboardData() {
     const dispHours = isLeader(user.role) ? Math.min(liveHours, LEADER_MAX_HRS) : liveHours;
     const dispOT    = isLeader(user.role) ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - liveHours)) : co.ot;
 
+    // Apply snapshot override — highest priority, overrides computed status
+    const ovr = snapshotOverrides[user.id];
+    if (ovr) {
+      status = ovr.status;
+      label  = ovr.statusLabel || ovr.status;
+    }
+
     users.push({
       id:user.id, name:user.name, role:user.role,
       status, statusLabel:label, shiftStart, shiftEnd, elapsed, shiftProgress,
@@ -920,6 +1035,7 @@ async function getDashboardData() {
       loginTime: state.loginTime ? fmtTime(new Date(state.loginTime)) : '',
       breakUsed: state.breakUsed||0, bblUsed: state.bblUsed||false,
       cutoffEnd: fmtDate(coDates.end),
+      snapshotOverride: ovr || null,
     });
   }
 
@@ -1046,6 +1162,53 @@ app.get('/admin/cutoff', async (req, res) => {
 });
 
 // ============================================================
+// SNAPSHOT OVERRIDE ENDPOINTS
+// ============================================================
+
+app.get('/admin/snapshot-overrides', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  res.json(await getSnapshotOverrides());
+});
+
+app.post('/admin/snapshot-override', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { uid, status, statusLabel, note } = req.body;
+  if (!uid || !status) return res.status(400).json({ error:'Missing uid or status' });
+  await setSnapshotOverride(uid, { status, statusLabel: statusLabel||status, note: note||'' });
+  res.json({ ok:true });
+});
+
+app.delete('/admin/snapshot-override/:uid', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  await clearSnapshotOverride(req.params.uid);
+  res.json({ ok:true });
+});
+
+app.delete('/admin/snapshot-overrides', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  await clearAllSnapshotOverrides();
+  res.json({ ok:true });
+});
+
+// STATE BYPASS — force-set a user's live state (emergency)
+app.post('/admin/state-override', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { uid, status, loginTime, shiftDate } = req.body;
+  if (!uid || !status) return res.status(400).json({ error:'Missing uid or status' });
+  const current = await getState(uid);
+  const newState = { ...current, status, ...(loginTime?{loginTime}:{}), ...(shiftDate?{shiftDate}:{}) };
+  await setState(uid, newState);
+  res.json({ ok:true, state: newState });
+});
+
+// Delete individual user state
+app.delete('/admin/user/:id/state', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  await clearState(req.params.id);
+  res.json({ ok:true });
+});
+
+// ============================================================
 // RESET ENDPOINTS (legacy support)
 // ============================================================
 app.get('/shift-reset', async (req, res) => {
@@ -1077,6 +1240,10 @@ async function runDailyReset() {
       await redisDel(key);
     }
     console.log(`[Scheduler] Daily reset: cleared ${keys.length} states`);
+
+    // Clear snapshot overrides — fresh shift day
+    await clearAllSnapshotOverrides();
+    console.log('[Scheduler] Snapshot overrides cleared');
 
     // Re-register webhook with drop_pending
     await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {

@@ -310,6 +310,22 @@ async function resetCutoffForUser(uid) {
   await setCutoffHours(uid, { hours:0, ot:0 });
 }
 
+// ── SNAPSHOT OVERRIDES ──────────────────────────────────────────────────────
+async function getSnapshotOverrides() {
+  try {
+    const raw = await redisGet('snapshot_overrides');
+    return raw ? JSON.parse(raw) : {};
+  } catch(e) { return {}; }
+}
+async function setSnapshotOverride(uid, data) {
+  const ov = await getSnapshotOverrides();
+  ov[uid]  = { ...(ov[uid]||{}), ...data, ts: new Date().toISOString() };
+  await redisSet('snapshot_overrides', JSON.stringify(ov));
+}
+async function clearAllSnapshotOverrides() {
+  await redisSet('snapshot_overrides', JSON.stringify({}));
+}
+
 // ============================================================
 // PAYABLE HOURS
 // ============================================================
@@ -914,7 +930,7 @@ async function getDashboardData() {
     const dispHours = isLeader(user.role) ? Math.min(liveHours, LEADER_MAX_HRS) : liveHours;
     const dispOT    = isLeader(user.role) ? Math.min(co.ot, Math.max(0, LEADER_MAX_HRS - liveHours)) : co.ot;
 
-    // Apply snapshot override — highest priority over computed status
+    // Snapshot override — highest priority, set by admin panel
     const ovr = snapshotOverrides[user.id];
     if (ovr?.snapStatus) {
       status = ovr.snapStatus;
@@ -1055,124 +1071,81 @@ app.get('/admin/cutoff', async (req, res) => {
 });
 
 // ============================================================
-// ADMIN PATCH STATE — update any field(s) on a user's Redis state
-// This is the single endpoint the admin panel calls for all cell edits.
-// Fields accepted: status, loginTime, shiftDate, outTime,
-//                  breakUsed, bblUsed, lunchUsed, lunchUsedMs,
-//                  overbreakMs, overlunchMs, isLate, lateMs
-// Times should be sent as Manila time strings e.g. "12:02 AM"
-// and will be converted to ISO using the shift date.
+// ADMIN PATCH STATE — update any field on a user's Redis state
 // ============================================================
 app.post('/admin/patch-state', async (req, res) => {
   if (!checkAuth(req, res)) return;
   const { uid, fields } = req.body;
-  if (!uid || !fields || typeof fields !== 'object')
-    return res.status(400).json({ error:'Missing uid or fields' });
+  if (!uid || !fields) return res.status(400).json({ error:'Missing uid or fields' });
 
   const user = await getUserById(uid);
   if (!user) return res.status(404).json({ error:'User not found' });
 
   const state = await getState(uid);
+  const updated = { ...state };
+  const shiftDate = fields.shiftDate || state.shiftDate || getManilaDateStr(manilaTime());
 
-  // Helper: convert a Manila time string like "12:02 AM" to ISO
-  // using the stored shiftDate or today
-  function manilaTimeToISO(timeStr, shiftDate) {
+  function manilaTimeToISO(timeStr, dateStr) {
     try {
-      const dateStr = shiftDate || getManilaDateStr(manilaTime());
-      // Use to24h to handle AM/PM
       const t24 = to24h(timeStr.trim());
       return new Date(`${dateStr}T${t24}:00+08:00`).toISOString();
     } catch(e) { return null; }
   }
 
-  // Apply each field
-  const updated = { ...state };
-  const shiftDate = fields.shiftDate || state.shiftDate || getManilaDateStr(manilaTime());
+  const statusMap = {
+    'active':'in','active-late':'in','ontime':'in','pre-shift':'pre-shift',
+    'missing':'out','offline':'out','earlyout':'out','restday':'out',
+    'absent':'absent','holiday':'holiday','leave':'leave','vto':'vto',
+    'break':'15','lunch':'lunch','bbl':'bbl',
+  };
 
   for (const [key, val] of Object.entries(fields)) {
     switch(key) {
       case 'status':
-        // Map snapshot status keys back to bot state keys
-        const statusMap = {
-          'active':'in', 'active-late':'in', 'ontime':'in',
-          'missing':'out', 'offline':'out',
-          'absent':'absent', 'holiday':'holiday', 'leave':'leave', 'vto':'vto',
-          'break':'15', 'lunch':'lunch', 'bbl':'bbl',
-          'pre-shift':'pre-shift', 'earlyout':'out', 'restday':'out',
-        };
-        updated.status   = statusMap[val] || val;
-        // Also set isLate flag
+        updated.status = statusMap[val] || val;
         if (val === 'active-late' || val === 'late') updated.isLate = true;
-        if (val === 'active')                        updated.isLate = false;
+        if (val === 'active') updated.isLate = false;
         break;
       case 'loginTime':
         const iso = manilaTimeToISO(val, shiftDate);
         if (iso) updated.loginTime = iso;
         break;
-      case 'shiftDate':
-        updated.shiftDate = val;
-        break;
-      case 'isLate':
-        updated.isLate = Boolean(val);
-        break;
-      case 'lateMs':
-        updated.lateMs = Number(val) || 0;
-        break;
-      case 'overbreakMs':
-        updated.overbreakMs = Number(val) || 0;
-        break;
-      case 'overlunchMs':
-        updated.overlunchMs = Number(val) || 0;
-        break;
-      case 'lunchUsedMs':
-        updated.lunchUsedMs = Number(val) || 0;
-        break;
-      case 'breakUsed':
-        updated.breakUsed = Number(val) || 0;
-        break;
-      case 'bblUsed':
-        updated.bblUsed = Boolean(val);
-        break;
-      case 'lunchUsed':
-        updated.lunchUsed = Boolean(val);
-        break;
-      // outTime, duration, break times are display-only — stored in snapshot_overrides
-      default:
-        break;
+      case 'shiftDate':   updated.shiftDate   = val; break;
+      case 'isLate':      updated.isLate      = Boolean(val); break;
+      case 'lateMs':      updated.lateMs      = Number(val)||0; break;
+      case 'overbreakMs': updated.overbreakMs = Number(val)||0; break;
+      case 'overlunchMs': updated.overlunchMs = Number(val)||0; break;
+      case 'lunchUsedMs': updated.lunchUsedMs = Number(val)||0; break;
+      case 'breakUsed':   updated.breakUsed   = Number(val)||0; break;
+      case 'bblUsed':     updated.bblUsed     = Boolean(val); break;
+      case 'lunchUsed':   updated.lunchUsed   = Boolean(val); break;
     }
   }
-
   await setState(uid, updated);
 
   // Display-only fields go into snapshot_overrides
-  const displayFields = ['outTime','duration','b15_1','b15_1r','b15_2','b15_2r',
-                         'lunch','lunchr','bbl','bblr','note','shiftStart'];
+  const displayKeys = ['outTime','duration','b15_1','b15_1r','b15_2','b15_2r',
+                       'lunch','lunchr','bbl','bblr','note','shiftStart'];
   const displayUpdates = {};
-  for (const f of displayFields) {
-    if (fields[f] !== undefined) displayUpdates[f] = fields[f];
-  }
-  // Also store status override for display
+  displayKeys.forEach(k => { if (fields[k] !== undefined) displayUpdates[k] = fields[k]; });
   if (fields.status) {
     const labelMap = {
-      'active':'On Time','active-late':'Late In','missing':'Missing',
-      'absent':'Absent','break':'On Break','lunch':'Lunch','bbl':'BBL',
-      'holiday':'Holiday','leave':'On Leave','vto':'VTO','offline':'Offline',
-      'pre-shift':'Pre-Shift','earlyout':'Early Out','restday':'Rest Day',
+      'active':'On Time','active-late':'Late In','missing':'Missing','absent':'Absent',
+      'break':'On Break','lunch':'Lunch','bbl':'BBL','holiday':'Holiday',
+      'leave':'On Leave','vto':'VTO','offline':'Offline','pre-shift':'Pre-Shift',
+      'earlyout':'Early Out','restday':'Rest Day',
     };
     displayUpdates.snapStatus      = fields.status;
     displayUpdates.snapStatusLabel = labelMap[fields.status] || fields.status;
   }
-
   if (Object.keys(displayUpdates).length > 0) {
-    const ov = await getSnapshotOverrides();
-    ov[uid]  = { ...(ov[uid]||{}), ...displayUpdates, ts: new Date().toISOString() };
-    await redisSet('snapshot_overrides', JSON.stringify(ov));
+    await setSnapshotOverride(uid, displayUpdates);
   }
 
   res.json({ ok:true, state: updated });
 });
 
-// Get snapshot overrides
+// Get all snapshot overrides
 app.get('/admin/snapshot-overrides', async (req, res) => {
   if (!checkAuth(req, res)) return;
   res.json(await getSnapshotOverrides());
@@ -1224,6 +1197,9 @@ async function runDailyReset() {
       await redisDel(key);
     }
     console.log(`[Scheduler] Daily reset: cleared ${keys.length} states`);
+
+    // Clear snapshot overrides for the new shift day
+    await clearAllSnapshotOverrides();
 
     // Re-register webhook with drop_pending
     await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {

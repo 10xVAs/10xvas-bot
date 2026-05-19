@@ -52,17 +52,34 @@ const VA_CUTOFF_DAYS      = 14;
 let redisClient = null;
 
 async function getRedis() {
-  if (redisClient) return redisClient;
+  // Return existing client only if it's actually ready
+  if (redisClient && redisClient.isReady) return redisClient;
+  // If client exists but is not ready (e.g. after a disconnect), reset it
+  if (redisClient && !redisClient.isReady) {
+    try { await redisClient.disconnect(); } catch(e) {}
+    redisClient = null;
+  }
   if (!REDIS_URL) return null;
   try {
     const { createClient } = require('redis');
-    redisClient = createClient({ url: REDIS_URL });
-    redisClient.on('error', e => console.error('Redis error:', e.message));
+    redisClient = createClient({
+      url: REDIS_URL,
+      socket: {
+        reconnectStrategy: (attempts) => Math.min(attempts * 100, 3000),
+      },
+    });
+    redisClient.on('error', e => {
+      console.error('Redis error:', e.message);
+      // Don't null out the client — redis v4 auto-reconnects
+    });
+    redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
+    redisClient.on('ready',        () => console.log('Redis ready'));
     await redisClient.connect();
     console.log('Redis connected');
     return redisClient;
   } catch(e) {
     console.error('Redis connect failed:', e.message);
+    redisClient = null;
     return null;
   }
 }
@@ -428,15 +445,15 @@ async function getUserShiftLogs(uid, days = 14) {
 
 // Date-range query across all users
 async function getShiftLogsRange(startDateStr, endDateStr) {
-  const logs  = [];
-  const start = new Date(startDateStr + 'T00:00:00+08:00');
-  const end   = new Date(endDateStr   + 'T23:59:59+08:00');
-  const days  = Math.ceil((end - start) / 86400000);
-  for (let i = 0; i <= days; i++) {
-    const d       = new Date(start.getTime() + i * 86400000);
-    const dateStr = getManilaDateStr(d);
+  const logs = [];
+  // Use noon PHT to avoid DST edge-cases; step one calendar day at a time
+  let cursor = new Date(startDateStr + 'T12:00:00+08:00');
+  const stop  = new Date(endDateStr  + 'T12:00:00+08:00');
+  while (cursor <= stop) {
+    const dateStr = getManilaDateStr(cursor);
     const day     = await getShiftLogs(dateStr);
     logs.push(...day);
+    cursor = new Date(cursor.getTime() + 86400000);
   }
   return logs;
 }
@@ -745,12 +762,14 @@ async function handleBreak(uid, name, breakType) {
   if (breakType==='lunch' && state.lunchUsed)
     return `⚠️ ${name}, you've already taken your lunch for this shift.`;
 
-  // Check lunch eligibility
+  // Check lunch eligibility — use stored shiftDate to get the correct schedule
+  // (getTodaySchedule can differ for overnight shifts after midnight)
   if (breakType==='lunch'||breakType==='bbl') {
-    const sched = getTodaySchedule(user, manilaTime());
-    if (sched) {
-      const shiftMins = minsBetween(getShiftWindow(sched, state.shiftDate||getManilaDateStr(manilaTime())).start,
-                                    getShiftWindow(sched, state.shiftDate||getManilaDateStr(manilaTime())).end);
+    const shiftDateForBreak = state.shiftDate || getManilaDateStr(manilaTime());
+    const schedForBreak     = getSchedForDate(user, shiftDateForBreak);
+    if (schedForBreak) {
+      const win       = getShiftWindow(schedForBreak, shiftDateForBreak);
+      const shiftMins = minsBetween(win.start, win.end);
       if (shiftMins < 510) return `⚠️ ${name}, your shift doesn't include a lunch period.`;
     }
   }
@@ -1101,9 +1120,15 @@ async function getDashboardData() {
   const snapshotOverrides = await getSnapshotOverrides();
   const users             = [];
 
-  for (const user of roster) {
-    const state = await getState(user.id);
-    const co    = await getCutoffHours(user.id);
+  // Fetch all states and cutoff hours in parallel — avoids N sequential Redis calls
+  const [allStates, allCutoffs] = await Promise.all([
+    Promise.all(roster.map(u => getState(u.id))),
+    Promise.all(roster.map(u => getCutoffHours(u.id))),
+  ]);
+
+  for (const [idx, user] of roster.entries()) {
+    const state = allStates[idx];
+    const co    = allCutoffs[idx];
 
     // Schedule lookup: active users use stored shiftDate (ground truth),
     // inactive users use 6PM-aware lookup for current window
@@ -1204,12 +1229,38 @@ async function getDashboardData() {
     const ovr = snapshotOverrides[user.id];
     if (ovr?.snapStatus) { status = ovr.snapStatus; label = ovr.snapStatusLabel || ovr.snapStatus; }
 
+    // Shift log enrichment — for offline/missing users, pull completed shift data
+    // so the snapshot always shows login/logout times even after state is cleared.
+    // ONLY runs if there is no active admin override on this user.
+    let loginTimeDisp  = state.loginTime ? fmtTime(new Date(state.loginTime)) : '';
+    let logoutTimeDisp = '';
+    let shiftHoursDisp = dispHours;
+    let shiftOTDisp    = dispOT;
+
+    const hasAdminOverride = !!(ovr?.snapStatus);
+    if (!hasAdminOverride && ['offline', 'missing'].includes(status) && sched && dateStr) {
+      try {
+        const sl = await getShiftLog(dateStr, user.id);
+        if (sl) {
+          if (sl.loginTime  && !loginTimeDisp)  loginTimeDisp  = fmtTime(new Date(sl.loginTime));
+          if (sl.logoutTime)                    logoutTimeDisp = fmtTime(new Date(sl.logoutTime));
+          if (sl.status === 'completed') {
+            status         = 'done';
+            label          = 'Done';
+            shiftHoursDisp = sl.hours  || 0;
+            shiftOTDisp    = sl.ot     || 0;
+          }
+        }
+      } catch(e) {}
+    }
+
     users.push({
       id:user.id, name:user.name, role:user.role,
       status, statusLabel:label, shiftStart, shiftEnd, elapsed, shiftProgress,
-      runningHours:dispHours, otHours:dispOT,
+      runningHours:shiftHoursDisp, otHours:shiftOTDisp,
       loginTime:     state.loginTime || '',
-      loginTimeDisp: state.loginTime ? fmtTime(new Date(state.loginTime)) : '',
+      loginTimeDisp,
+      logoutTimeDisp,
       breakStart:    state.breakStart || '',
       breakUsed: state.breakUsed||0, bblUsed: state.bblUsed||false,
       cutoffEnd: fmtDate(coDates.end),
@@ -1220,7 +1271,7 @@ async function getDashboardData() {
   const statusOrder = {
     missing:0, absent:1, overbreak:2, late:3,
     break:4, lunch:5, bbl:6, active:7,
-    'pre-shift':8, offset:9, holiday:10, leave:11, vto:12, offline:13,
+    'pre-shift':8, offset:9, holiday:10, leave:11, vto:12, done:13, offline:14,
   };
   const roleOrder = { Leader:0, UYP:1, VA:2, Admin:2 };
   users.sort((a,b) => {
@@ -1265,7 +1316,7 @@ app.post('/admin/roster', async (req, res) => {
   const { roster } = req.body;
   if (!Array.isArray(roster)) return res.status(400).json({ error:'Invalid roster' });
   await saveRoster(roster);
-  rosterCache = null;
+  // saveRoster already updates rosterCache — no null needed
   res.json({ ok:true, count:roster.length });
 });
 
@@ -1506,6 +1557,7 @@ app.get('/admin/shiftlogs-summary', async (req, res) => {
 // RESET ENDPOINTS (legacy support)
 // ============================================================
 app.get('/shift-reset', async (req, res) => {
+  if (!checkAuth(req, res)) return;   // was unprotected — now requires admin pass
   const keys = await redisKeys('state:*');
   for (const k of keys) await redisDel(k);
   try {
@@ -1573,9 +1625,30 @@ async function runCutoffReset() {
   } catch(e) { console.error('[Scheduler] Cutoff reset error:', e.message); }
 }
 
-// Track last run dates to avoid double-firing
-let lastDailyReset   = '';
-let lastCutoffReset  = '';
+// Track last run dates — persisted in Redis to survive server restarts/deploys
+// In-memory fallback is intentionally blank; Redis is the source of truth
+let lastDailyReset  = '';
+let lastCutoffReset = '';
+
+async function getLastResetDates() {
+  try {
+    const raw = await redisGet('scheduler:last_resets');
+    if (raw) {
+      const d = JSON.parse(raw);
+      lastDailyReset  = d.daily  || '';
+      lastCutoffReset = d.cutoff || '';
+    }
+  } catch(e) {}
+}
+
+async function saveLastResetDates() {
+  try {
+    await redisSet('scheduler:last_resets', JSON.stringify({
+      daily:  lastDailyReset,
+      cutoff: lastCutoffReset,
+    }));
+  } catch(e) {}
+}
 
 // Run every minute — check if it's time to fire
 setInterval(async () => {
@@ -1585,15 +1658,13 @@ setInterval(async () => {
     // Daily reset: 6:00 PM Manila (18:00) — skip on cutoff reset days
     if (h === 18 && m === 0 && lastDailyReset !== dateStr) {
       const roster = await getRoster();
-      // Only run daily reset if today is NOT the last cutoff day for any group
-      // (cutoff reset takes precedence and handles state clearing)
       const isCutoffDay = roster.some(u => isLastCutoffDay(u.role));
+      lastDailyReset = dateStr;
+      await saveLastResetDates();
       if (!isCutoffDay) {
-        lastDailyReset = dateStr;
         await runDailyReset();
       } else {
         console.log('[Scheduler] Skipping daily reset — cutoff day takes precedence');
-        lastDailyReset = dateStr;
       }
     }
 
@@ -1603,6 +1674,7 @@ setInterval(async () => {
       const hasCutoffToday = roster.some(u => isLastCutoffDay(u.role));
       if (hasCutoffToday) {
         lastCutoffReset = dateStr;
+        await saveLastResetDates();
         await runCutoffReset();
       }
     }
@@ -1624,9 +1696,10 @@ app.get('/', (req, res) => res.json({
 // START
 // ============================================================
 app.listen(PORT, async () => {
-  console.log(`10X VAs bot v3.0 on port ${PORT}`);
+  console.log(`10X VAs bot v3.1 on port ${PORT}`);
   await getRedis();
   await getRoster(); // seed roster if not exists
+  await getLastResetDates(); // restore scheduler state — prevents accidental reset on redeploy
   try {
     await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
       url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,

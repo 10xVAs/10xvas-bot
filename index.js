@@ -458,9 +458,38 @@ async function getShiftLogsRange(startDateStr, endDateStr) {
   return logs;
 }
 
-// ============================================================
-// PAYABLE HOURS
-// ============================================================
+// Parse a shift log's events array into snapshot-ready break time strings.
+// Returns fields that match the patch-state displayKeys: b15_1/r, b15_2/r, lunch/r, bbl/r.
+function parseShiftEvents(events) {
+  const r = { b15_1:'', b15_1r:'', b15_2:'', b15_2r:'', lunch:'', lunchr:'', bbl:'', bblr:'' };
+  if (!events || !events.length) return r;
+  let breakCount   = 0;
+  let lastBreakType = null;
+  for (const ev of events) {
+    if (!ev || !ev.time) continue;
+    const t = fmtTime(new Date(ev.time));
+    if (ev.action === '15' || ev.action === '30') {
+      breakCount++;
+      lastBreakType = ev.action;
+      if      (breakCount === 1) r.b15_1 = t;
+      else if (breakCount === 2) r.b15_2 = t;
+    } else if (ev.action === 'lunch') {
+      lastBreakType = 'lunch';
+      r.lunch = t;
+    } else if (ev.action === 'bbl') {
+      lastBreakType = 'bbl';
+      r.bbl = t;
+    } else if (ev.action === 'back') {
+      if (lastBreakType === '15' || lastBreakType === '30') {
+        if      (breakCount === 1) r.b15_1r = t;
+        else if (breakCount === 2) r.b15_2r = t;
+      } else if (lastBreakType === 'lunch') { r.lunchr = t; }
+      else if (lastBreakType === 'bbl')    { r.bblr   = t; }
+      lastBreakType = null;
+    }
+  }
+  return r;
+}
 function calcPayable(user, state, logoutTime) {
   try {
     const role  = user.role;
@@ -1126,22 +1155,29 @@ async function getDashboardData() {
     Promise.all(roster.map(u => getCutoffHours(u.id))),
   ]);
 
+  // Pre-compute each user's effective shiftDate (synchronous) so we can
+  // batch-fetch all shift logs in one round trip before the main loop.
+  const schedInfos = roster.map((user, idx) => {
+    const state    = allStates[idx];
+    const isActive = !['out','holiday','absent','leave','vto'].includes(state.status);
+    if (isActive && state.shiftDate) {
+      return { dateStr: state.shiftDate, sched: getSchedForDate(user, state.shiftDate) };
+    }
+    const r = getTodayScheduleWithDate(user, manila);
+    return { sched: r.sched, dateStr: r.dateStr };
+  });
+
+  const allShiftLogs = await Promise.all(
+    roster.map((user, idx) => getShiftLog(schedInfos[idx].dateStr, user.id))
+  );
+
   for (const [idx, user] of roster.entries()) {
     const state = allStates[idx];
     const co    = allCutoffs[idx];
+    const sl    = allShiftLogs[idx];  // today's shift log (may be null)
 
-    // Schedule lookup: active users use stored shiftDate (ground truth),
-    // inactive users use 6PM-aware lookup for current window
-    const isActive = !['out','holiday','absent','leave','vto'].includes(state.status);
-    let sched, dateStr;
-    if (isActive && state.shiftDate) {
-      dateStr = state.shiftDate;
-      sched   = getSchedForDate(user, dateStr);
-    } else {
-      const r = getTodayScheduleWithDate(user, manila);
-      sched   = r.sched;
-      dateStr = r.dateStr;
-    }
+    // Use pre-computed schedule info
+    const { sched, dateStr } = schedInfos[idx];
 
     let status='offline', label='Offline', elapsed='', shiftStart='', shiftEnd='', shiftProgress=0;
 
@@ -1188,12 +1224,10 @@ async function getDashboardData() {
 
     const coDates = getCutoffDates(user.role);
 
-    // Server-side live hours calculation
+    // Server-side live hours calculation (uses pre-computed sched/dateStr)
     let liveHours = co.hours;
     if (state.loginTime && ['in','pre-shift','15','30','lunch','bbl'].includes(state.status)) {
       try {
-        const dateStr2 = state.shiftDate || getManilaDateStr(manila);
-
         // Leader day-off: all hours = OT, no shift window
         if (state.leaderDayOff && isLeader(user.role)) {
           const login   = new Date(state.loginTime);
@@ -1201,23 +1235,20 @@ async function getDashboardData() {
           const lunchMs = state.lunchUsedMs || 0;
           const netMs   = Math.max(0, grossMs - lunchMs - (state.overbreakMs||0) - (state.overlunchMs||0));
           // For leaders, OT is separate — don't add to liveHours for display
-        } else {
-          const sched2 = getSchedForDate(user, dateStr2);
-          if (sched2) {
-            const win2     = getShiftWindow(sched2, dateStr2);
-            const login    = new Date(state.loginTime);
-            const effLogin = login > win2.start ? login : win2.start;
-            const effNow   = now < win2.end ? now : win2.end;
-            let grossMs    = Math.max(0, effNow - effLogin);
-            let lateMs     = Math.max(0, effLogin - win2.start);
-            if (lateMs <= GRACE_MINS * 60000) lateMs = 0;
-            const breakMs  = (state.overbreakMs||0) + (state.overlunchMs||0);
-            const lunchMs  = state.lunchUsedMs || 0;
-            let netMs      = Math.max(0, grossMs - lateMs - breakMs - lunchMs);
-            let liveShift  = netMs / 3600000;
-            if (!isLeader(user.role)) liveShift = Math.min(liveShift, MAX_SHIFT_HRS);
-            liveHours = Math.round((co.hours + liveShift) * 100) / 100;
-          }
+        } else if (sched) {
+          const win2     = getShiftWindow(sched, dateStr);
+          const login    = new Date(state.loginTime);
+          const effLogin = login > win2.start ? login : win2.start;
+          const effNow   = now < win2.end ? now : win2.end;
+          let grossMs    = Math.max(0, effNow - effLogin);
+          let lateMs     = Math.max(0, effLogin - win2.start);
+          if (lateMs <= GRACE_MINS * 60000) lateMs = 0;
+          const breakMs  = (state.overbreakMs||0) + (state.overlunchMs||0);
+          const lunchMs  = state.lunchUsedMs || 0;
+          let netMs      = Math.max(0, grossMs - lateMs - breakMs - lunchMs);
+          let liveShift  = netMs / 3600000;
+          if (!isLeader(user.role)) liveShift = Math.min(liveShift, MAX_SHIFT_HRS);
+          liveHours = Math.round((co.hours + liveShift) * 100) / 100;
         }
       } catch(e) {}
     }
@@ -1238,31 +1269,42 @@ async function getDashboardData() {
     let shiftOTDisp    = dispOT;
 
     const hasAdminOverride = !!(ovr?.snapStatus);
-    if (!hasAdminOverride && ['offline', 'missing'].includes(status) && sched && dateStr) {
-      try {
-        const sl = await getShiftLog(dateStr, user.id);
-        if (sl) {
-          if (sl.loginTime  && !loginTimeDisp)  loginTimeDisp  = fmtTime(new Date(sl.loginTime));
-          if (sl.logoutTime)                    logoutTimeDisp = fmtTime(new Date(sl.logoutTime));
-          if (sl.status === 'completed') {
-            status         = 'done';
-            label          = 'Done';
-            shiftHoursDisp = sl.hours  || 0;
-            shiftOTDisp    = sl.ot     || 0;
-          }
-        }
-      } catch(e) {}
+    if (!hasAdminOverride && ['offline', 'missing'].includes(status) && sl) {
+      if (sl.loginTime  && !loginTimeDisp)  loginTimeDisp  = fmtTime(new Date(sl.loginTime));
+      if (sl.logoutTime)                    logoutTimeDisp = fmtTime(new Date(sl.logoutTime));
+      if (sl.status === 'completed') {
+        status         = 'done';
+        label          = 'Done';
+        shiftHoursDisp = sl.hours  || 0;
+        shiftOTDisp    = sl.ot     || 0;
+      }
     }
+
+    // Derive break times from shift log events.
+    // Priority: Redis snapshotOverride (admin patch) > shift log auto-parse
+    const slBreaks  = parseShiftEvents(sl?.events);
+    const b15_1     = ovr?.b15_1   || slBreaks.b15_1   || '';
+    const b15_1r    = ovr?.b15_1r  || slBreaks.b15_1r  || '';
+    const b15_2     = ovr?.b15_2   || slBreaks.b15_2   || '';
+    const b15_2r    = ovr?.b15_2r  || slBreaks.b15_2r  || '';
+    const lunchStr  = ovr?.lunch   || slBreaks.lunch   || '';
+    const lunchrStr = ovr?.lunchr  || slBreaks.lunchr  || '';
+    const bblStr    = ovr?.bbl     || slBreaks.bbl     || '';
+    const bblrStr   = ovr?.bblr    || slBreaks.bblr    || '';
 
     users.push({
       id:user.id, name:user.name, role:user.role,
       status, statusLabel:label, shiftStart, shiftEnd, elapsed, shiftProgress,
       runningHours:shiftHoursDisp, otHours:shiftOTDisp,
+      isLate: state.isLate || false,
       loginTime:     state.loginTime || '',
       loginTimeDisp,
       logoutTimeDisp,
       breakStart:    state.breakStart || '',
       breakUsed: state.breakUsed||0, bblUsed: state.bblUsed||false,
+      b15_1, b15_1r, b15_2, b15_2r,
+      lunch: lunchStr, lunchr: lunchrStr,
+      bbl:   bblStr,   bblr:  bblrStr,
       cutoffEnd: fmtDate(coDates.end),
       snapshotOverride: ovr || null,
     });

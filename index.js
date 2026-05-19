@@ -369,6 +369,79 @@ async function clearAllSnapshotOverrides() {
 }
 
 // ============================================================
+// SHIFT LOG — persistent daily records
+// Key: shiftlog:{shiftDate}:{uid}   TTL: 45 days
+// ============================================================
+const SHIFTLOG_TTL = 45 * 86400; // seconds
+
+async function getShiftLog(shiftDate, uid) {
+  try {
+    const raw = await redisGet(`shiftlog:${shiftDate}:${uid}`);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) { return null; }
+}
+
+async function setShiftLog(shiftDate, uid, data) {
+  const key  = `shiftlog:${shiftDate}:${uid}`;
+  const json = JSON.stringify({ ...data, updatedAt: new Date().toISOString() });
+  try {
+    const r = await getRedis();
+    if (r) { await r.set(key, json, { EX: SHIFTLOG_TTL }); return; }
+  } catch(e) {}
+  MEM[key] = json; // in-memory fallback (no TTL)
+}
+
+// Append a timestamped event to an existing shift log
+async function appendShiftEvent(shiftDate, uid, action, time) {
+  const log = await getShiftLog(shiftDate, uid);
+  if (!log) return;
+  const events = [...(log.events || []), { action, time: time.toISOString() }];
+  await setShiftLog(shiftDate, uid, { ...log, events });
+}
+
+// All logs for a given shiftDate (all users)
+async function getShiftLogs(shiftDate) {
+  const keys = await redisKeys(`shiftlog:${shiftDate}:*`);
+  const logs = [];
+  for (const key of keys) {
+    try {
+      const raw = await redisGet(key);
+      if (raw) logs.push(JSON.parse(raw));
+    } catch(e) {}
+  }
+  logs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  return logs;
+}
+
+// Last N days of logs for one user
+async function getUserShiftLogs(uid, days = 14) {
+  const logs   = [];
+  const manila = manilaTime();
+  for (let i = 0; i < days; i++) {
+    const d       = new Date(manila.getTime() - i * 86400000);
+    const dateStr = getManilaDateStr(d);
+    const log     = await getShiftLog(dateStr, uid);
+    if (log) logs.push(log);
+  }
+  return logs; // newest first
+}
+
+// Date-range query across all users
+async function getShiftLogsRange(startDateStr, endDateStr) {
+  const logs  = [];
+  const start = new Date(startDateStr + 'T00:00:00+08:00');
+  const end   = new Date(endDateStr   + 'T23:59:59+08:00');
+  const days  = Math.ceil((end - start) / 86400000);
+  for (let i = 0; i <= days; i++) {
+    const d       = new Date(start.getTime() + i * 86400000);
+    const dateStr = getManilaDateStr(d);
+    const day     = await getShiftLogs(dateStr);
+    logs.push(...day);
+  }
+  return logs;
+}
+
+// ============================================================
 // PAYABLE HOURS
 // ============================================================
 function calcPayable(user, state, logoutTime) {
@@ -519,6 +592,16 @@ async function handleIn(uid, name) {
       isLate:false, lateMs:0, leaderDayOff:true,
     });
     logToSheet(uid, name, 'in', now).catch(console.error);
+    // Shift log — OT day-off session
+    setShiftLog(dateStr, uid, {
+      uid, name, role: user.role, shiftDate: dateStr,
+      loginTime: now.toISOString(), logoutTime: null,
+      status: 'active', hours: 0, ot: 0,
+      isLate: false, lateMs: 0, leaderDayOff: true,
+      breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+      overbreakMs: 0, overlunchMs: 0,
+      events: [{ action: 'in', time: now.toISOString() }],
+    }).catch(console.error);
     return `✅ Log In confirmed — ${name}. Flexible OT session started. Have a great shift! 💪`;
   }
 
@@ -550,6 +633,18 @@ async function handleIn(uid, name) {
   });
 
   logToSheet(uid, name, 'in', now).catch(console.error);
+
+  // Shift log — create or reset (re-login same day preserves prior events)
+  const existingLog = await getShiftLog(dateStr, uid) || {};
+  setShiftLog(dateStr, uid, {
+    uid, name, role: user.role, shiftDate: dateStr,
+    loginTime: now.toISOString(), logoutTime: existingLog.logoutTime || null,
+    status: 'active', hours: existingLog.hours || 0, ot: existingLog.ot || 0,
+    isLate, lateMs: isLate ? minsLate * 60000 : 0,
+    breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+    overbreakMs: 0, overlunchMs: 0,
+    events: [...(existingLog.events || []), { action: 'in', time: now.toISOString() }],
+  }).catch(console.error);
 
   if (isVeryEarly && !isLeader(user.role))
     return `🌅 Log In confirmed — ${name}. You're early! Your shift starts at ${fmtTime(win.start)} Manila. We'll mark you active then. 💪`;
@@ -590,6 +685,27 @@ async function handleOut(uid, name) {
       await addCutoffHours(uid, name, user.role, result.hours, result.ot);
       const hoursStr = result.hours.toFixed(2);
       const otStr    = result.ot > 0 ? ` (+${result.ot.toFixed(2)}h OT)` : '';
+
+      // Finalize shift log
+      const shiftDateForLog = savedState.shiftDate;
+      const existingLog     = await getShiftLog(shiftDateForLog, uid) || {};
+      setShiftLog(shiftDateForLog, uid, {
+        ...existingLog,
+        logoutTime:  now.toISOString(),
+        status:      'completed',
+        hours:       result.hours,
+        ot:          result.ot,
+        isLate:      savedState.isLate  || false,
+        lateMs:      savedState.lateMs  || 0,
+        overbreakMs: savedState.overbreakMs || 0,
+        overlunchMs: savedState.overlunchMs || 0,
+        lunchUsedMs: savedState.lunchUsedMs || 0,
+        breakUsed:   savedState.breakUsed   || 0,
+        bblUsed:     savedState.bblUsed     || false,
+        lunchUsed:   savedState.lunchUsed   || false,
+        events:      [...(existingLog.events || []), { action: 'out', time: now.toISOString() }],
+      }).catch(console.error);
+
       logToSheet(uid, name, 'out', now).catch(console.error);
       return `👋 Log Out confirmed — ${name}. Total hours for today: <b>${hoursStr}h${otStr}</b>. Contact your manager for any disputes.`;
     }
@@ -641,6 +757,10 @@ async function handleBreak(uid, name, breakType) {
 
   await setState(uid, { ...state, status:breakType, breakStart:now.toISOString(), breakType });
   logToSheet(uid, name, breakType, now).catch(console.error);
+
+  // Append break event to shift log
+  const shiftDateB = state.shiftDate || getManilaDateStr(manilaTime());
+  appendShiftEvent(shiftDateB, uid, breakType, now).catch(console.error);
 
   const msgs = {
     '15':    `⏸️ Break confirmed — ${name}. Be back by <b>${fmtTime(back)}</b>. ☕`,
@@ -699,6 +819,23 @@ async function handleBack(uid, name) {
   state.status='in'; state.breakStart=null; state.breakType=null;
   await setState(uid, state);
   logToSheet(uid, name, 'back', now).catch(console.error);
+
+  // Append back event and sync break stats to shift log
+  const shiftDateR = state.shiftDate || getManilaDateStr(manilaTime());
+  appendShiftEvent(shiftDateR, uid, 'back', now)
+    .then(async () => {
+      const log = await getShiftLog(shiftDateR, uid);
+      if (log) await setShiftLog(shiftDateR, uid, {
+        ...log,
+        breakUsed:   state.breakUsed   || 0,
+        bblUsed:     state.bblUsed     || false,
+        lunchUsed:   state.lunchUsed   || false,
+        lunchUsedMs: state.lunchUsedMs || 0,
+        overbreakMs: state.overbreakMs || 0,
+        overlunchMs: state.overlunchMs || 0,
+      });
+    }).catch(console.error);
+
   return `✅ Welcome back, ${name}!${overMsg}`;
 }
 
@@ -726,6 +863,23 @@ async function handleOffsetIn(uid, name) {
 
   await setState(uid, { ...state, status:'offset', offsetStart:now.toISOString() });
   logToSheet(uid, name, 'offset-in', now).catch(console.error);
+
+  // Append event to today's shift log (create one if no shift today)
+  const offsetDateIn  = getManilaDateStr(manilaTime());
+  const offsetLogIn   = await getShiftLog(offsetDateIn, uid);
+  if (offsetLogIn) {
+    appendShiftEvent(offsetDateIn, uid, 'offset-in', now).catch(console.error);
+  } else {
+    setShiftLog(offsetDateIn, uid, {
+      uid, name, role: user.role, shiftDate: offsetDateIn,
+      loginTime: null, logoutTime: null, status: 'offset',
+      hours: 0, ot: 0, isLate: false, lateMs: 0,
+      breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+      overbreakMs: 0, overlunchMs: 0,
+      events: [{ action: 'offset-in', time: now.toISOString() }],
+    }).catch(console.error);
+  }
+
   return `⏱️ Offset confirmed — ${name}. Remaining this cutoff: <b>${remaining}h</b>. Make it count! 💪`;
 }
 
@@ -746,6 +900,19 @@ async function handleOffsetOut(uid, name) {
   await addCutoffHours(uid, name, user.role, durationHrs, 0);
   await setState(uid, { ...state, status:'out', offsetStart:null });
   logToSheet(uid, name, 'offset-out', now).catch(console.error);
+
+  // Update shift log with offset-out event and accumulated hours
+  const offsetDateOut = getManilaDateStr(manilaTime());
+  const offsetLogOut  = await getShiftLog(offsetDateOut, uid);
+  if (offsetLogOut) {
+    setShiftLog(offsetDateOut, uid, {
+      ...offsetLogOut,
+      status: offsetLogOut.status === 'offset' ? 'completed' : offsetLogOut.status,
+      hours:  Math.round((offsetLogOut.hours + durationHrs) * 100) / 100,
+      events: [...(offsetLogOut.events || []), { action: 'offset-out', time: now.toISOString() }],
+    }).catch(console.error);
+  }
+
   return `✅ Offset hours logged — ${name}. Duration: <b>${fmtDuration(now-startTime)}</b>. Remaining: <b>${remaining}h</b>.`;
 }
 
@@ -765,6 +932,20 @@ async function handleDayOverride(uid, name, type) {
 
   if (addsHours) await addCutoffHours(uid, name, user.role, MAX_SHIFT_HRS, 0);
   logToSheet(uid, name, type, now).catch(console.error);
+
+  // Create shift log entry for day overrides
+  const overrideDateStr = getManilaDateStr(manilaTime());
+  setShiftLog(overrideDateStr, uid, {
+    uid, name, role: user.role, shiftDate: overrideDateStr,
+    loginTime: null, logoutTime: null,
+    status: type,
+    hours:  addsHours ? MAX_SHIFT_HRS : 0,
+    ot:     0,
+    isLate: false, lateMs: 0,
+    breakUsed: 0, bblUsed: false, lunchUsed: false, lunchUsedMs: 0,
+    overbreakMs: 0, overlunchMs: 0,
+    events: [{ action: type, time: now.toISOString() }],
+  }).catch(console.error);
 
   const msgs = {
     holiday: `🎉 Holiday logged — ${name}. Enjoy your day off!`,
@@ -1234,6 +1415,94 @@ app.delete('/admin/user/:id/state', async (req, res) => {
 });
 
 // ============================================================
+// SHIFT LOG ADMIN ENDPOINTS
+// ============================================================
+
+// GET /admin/shiftlogs?date=YYYY-MM-DD  — all users for a date
+// GET /admin/shiftlogs?start=YYYY-MM-DD&end=YYYY-MM-DD  — date range
+// GET /admin/shiftlogs  — defaults to today (Manila)
+app.get('/admin/shiftlogs', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { date, start, end } = req.query;
+  try {
+    if (start && end) {
+      const logs = await getShiftLogsRange(start, end);
+      return res.json(logs);
+    }
+    const targetDate = date || getManilaDateStr(manilaTime());
+    const logs = await getShiftLogs(targetDate);
+    res.json(logs);
+  } catch(e) {
+    console.error('/admin/shiftlogs:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /admin/shiftlogs/:uid?days=14  — one user, last N days
+app.get('/admin/shiftlogs/:uid', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const days = Math.min(parseInt(req.query.days) || 14, 45);
+  try {
+    const logs = await getUserShiftLogs(req.params.uid, days);
+    res.json(logs);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /admin/shiftlogs/:uid/:date — manual override of a shift log entry
+app.post('/admin/shiftlogs/:uid/:date', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { uid, date } = req.params;
+  const user = await getUserById(uid);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  try {
+    const existing = await getShiftLog(date, uid) || {};
+    const updated  = { uid, name: user.name, role: user.role, shiftDate: date, ...existing, ...req.body };
+    await setShiftLog(date, uid, updated);
+    res.json({ ok: true, log: updated });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /admin/shiftlogs-summary?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Returns per-user totals over a date range (useful for payroll review)
+app.get('/admin/shiftlogs-summary', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const { start, end } = req.query;
+  if (!start || !end) return res.status(400).json({ error: 'start and end required' });
+  try {
+    const logs    = await getShiftLogsRange(start, end);
+    const summary = {};
+    for (const log of logs) {
+      if (!summary[log.uid]) {
+        summary[log.uid] = {
+          uid: log.uid, name: log.name, role: log.role,
+          totalHours: 0, totalOT: 0, daysWorked: 0,
+          daysAbsent: 0, daysHoliday: 0, daysLeave: 0, daysVTO: 0,
+          lateCount: 0, overbreakCount: 0,
+        };
+      }
+      const s = summary[log.uid];
+      if (['completed','active'].includes(log.status)) {
+        s.totalHours   = Math.round((s.totalHours + (log.hours || 0)) * 100) / 100;
+        s.totalOT      = Math.round((s.totalOT    + (log.ot    || 0)) * 100) / 100;
+        s.daysWorked++;
+        if (log.isLate)      s.lateCount++;
+        if ((log.overbreakMs || 0) + (log.overlunchMs || 0) > 0) s.overbreakCount++;
+      } else if (log.status === 'absent') s.daysAbsent++;
+      else if (log.status === 'holiday')  s.daysHoliday++;
+      else if (log.status === 'leave')    s.daysLeave++;
+      else if (log.status === 'vto')      s.daysVTO++;
+    }
+    res.json(Object.values(summary).sort((a,b) => a.name.localeCompare(b.name)));
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
 // RESET ENDPOINTS (legacy support)
 // ============================================================
 app.get('/shift-reset', async (req, res) => {
@@ -1344,9 +1613,10 @@ setInterval(async () => {
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => res.json({
-  status:'ok', bot:'10X VAs v3.0',
+  status:'ok', bot:'10X VAs v3.1 — Phase 2',
   redis: REDIS_URL ? 'configured' : 'not configured',
   sheets: GOOGLE_SA ? 'configured' : 'not configured',
+  shiftLogs: 'enabled (45d TTL)',
   time: new Date().toISOString(),
 }));
 
@@ -1420,6 +1690,9 @@ app.get('/me/:uid', async (req, res) => {
 
   const coDates = getCutoffDates(user.role);
 
+  // Recent shift logs for mini app history view (last 7 days)
+  const recentLogs = await getUserShiftLogs(uid, 7);
+
   res.json({
     id:           user.id,
     name:         user.name,
@@ -1432,6 +1705,7 @@ app.get('/me/:uid', async (req, res) => {
     runningHours: liveHours,
     otHours:      co.ot,
     cutoffEnd:    fmtDate(coDates.end),
+    recentLogs,
   });
 });
 

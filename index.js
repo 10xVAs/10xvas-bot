@@ -11,6 +11,23 @@ const app     = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ============================================================
+// GLOBAL CRASH GUARD
+// Node 18+ kills the process on unhandled promise rejections.
+// These handlers log the error and keep the process alive.
+// Without these, any unexpected async error anywhere crashes
+// the server, clears the in-memory state, and causes Telegram
+// to replay all queued messages on restart.
+// ============================================================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[CRASH GUARD] Unhandled promise rejection:', reason?.message || reason);
+  // Do NOT exit — let the server keep running
+});
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH GUARD] Uncaught exception:', err.message);
+  // Do NOT exit — keep running
+});
+
 // CORS — allow GHL and any origin to connect
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1073,9 +1090,26 @@ async function handleHelp(uid, name) {
 }
 
 // ============================================================
-// WEBHOOK
+// DEDUP — Redis-backed update_id tracking (survives restarts)
+// TTL: 48h — longer than Telegram's 24h message delivery window
 // ============================================================
-const processed = new Set();
+const DEDUP_TTL = 48 * 3600; // seconds
+
+async function isDuplicate(updateId) {
+  const key = `dedup:${updateId}`;
+  try {
+    const r = await getRedis();
+    if (r) {
+      // SET NX (only if not exists) — atomic check+set in one call
+      const result = await r.set(key, '1', { NX: true, EX: DEDUP_TTL });
+      return result === null; // null = key already existed → duplicate
+    }
+  } catch(e) { console.error('isDuplicate Redis error:', e.message); }
+  // In-memory fallback
+  if (MEM[key]) return true;
+  MEM[key] = '1';
+  return false;
+}
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -1093,9 +1127,7 @@ app.post('/webhook', async (req, res) => {
 
     if (chatId !== ALLOWED_CHAT) return;
     if (topicId !== TOPIC_ID)    return;
-    if (processed.has(updateId)) return;
-    processed.add(updateId);
-    if (processed.size > 2000) processed.delete(processed.values().next().value);
+    if (await isDuplicate(updateId)) return;
 
     // Check if user exists in roster
     const user = await getUserById(uid);
@@ -1134,12 +1166,17 @@ app.post('/webhook', async (req, res) => {
 // DASHBOARD API
 // ============================================================
 app.get('/dashboard', async (req, res) => {
-  const cb   = req.query.callback;
-  const data = await getDashboardData();
-  if (cb) {
-    res.setHeader('Content-Type','application/javascript');
-    res.send(`${cb}(${JSON.stringify(data)})`);
-  } else res.json(data);
+  try {
+    const cb   = req.query.callback;
+    const data = await getDashboardData();
+    if (cb) {
+      res.setHeader('Content-Type','application/javascript');
+      res.send(`${cb}(${JSON.stringify(data)})`);
+    } else res.json(data);
+  } catch(e) {
+    console.error('/dashboard error:', e.message);
+    res.status(500).json({ error: 'Dashboard unavailable', detail: e.message });
+  }
 });
 
 async function getDashboardData() {
@@ -1348,8 +1385,10 @@ function checkAuth(req, res) {
 // Get roster
 app.get('/admin/roster', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  const roster = await getRoster();
-  res.json(roster);
+  try {
+    const roster = await getRoster();
+    res.json(roster);
+  } catch(e) { console.error('/admin/roster:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Update full roster
@@ -1357,9 +1396,10 @@ app.post('/admin/roster', async (req, res) => {
   if (!checkAuth(req, res)) return;
   const { roster } = req.body;
   if (!Array.isArray(roster)) return res.status(400).json({ error:'Invalid roster' });
-  await saveRoster(roster);
-  // saveRoster already updates rosterCache — no null needed
-  res.json({ ok:true, count:roster.length });
+  try {
+    await saveRoster(roster);
+    res.json({ ok:true, count:roster.length });
+  } catch(e) { console.error('/admin/roster POST:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Add/update single user
@@ -1390,13 +1430,15 @@ app.delete('/admin/user/:id', async (req, res) => {
 // Get all states (admin view)
 app.get('/admin/states', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  const keys   = await redisKeys('state:*');
-  const states = {};
-  for (const k of keys) {
-    const uid = k.replace('state:','');
-    states[uid] = await getState(uid);
-  }
-  res.json(states);
+  try {
+    const keys   = await redisKeys('state:*');
+    const states = {};
+    for (const k of keys) {
+      const uid = k.replace('state:','');
+      states[uid] = await getState(uid);
+    }
+    res.json(states);
+  } catch(e) { console.error('/admin/states:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Reset all states
@@ -1426,10 +1468,12 @@ app.post('/admin/seed-cutoff', async (req, res) => {
 // Get cutoff hours
 app.get('/admin/cutoff', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  const roster = await getRoster();
-  const result = {};
-  for (const u of roster) result[u.id] = { name:u.name, role:u.role, ...(await getCutoffHours(u.id)) };
-  res.json(result);
+  try {
+    const roster = await getRoster();
+    const result = {};
+    for (const u of roster) result[u.id] = { name:u.name, role:u.role, ...(await getCutoffHours(u.id)) };
+    res.json(result);
+  } catch(e) { console.error('/admin/cutoff:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
@@ -1492,7 +1536,8 @@ app.post('/admin/patch-state', async (req, res) => {
 
 app.get('/admin/snapshot-overrides', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  res.json(await getSnapshotOverrides());
+  try { res.json(await getSnapshotOverrides()); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/admin/snapshot-overrides', async (req, res) => {
@@ -1503,8 +1548,8 @@ app.delete('/admin/snapshot-overrides', async (req, res) => {
 
 app.delete('/admin/user/:id/state', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  await clearState(req.params.id);
-  res.json({ ok:true });
+  try { await clearState(req.params.id); res.json({ ok:true }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
@@ -1611,8 +1656,77 @@ app.get('/shift-reset', async (req, res) => {
 });
 
 // ============================================================
-// SCHEDULER — daily reset + cutoff reset
+// GRACEFUL AUTO-LOGOUT
+// Called before any state wipe (daily reset / cutoff reset).
+// Finalises open sessions: saves hours to cutoff + shift log,
+// sends a Telegram notification, then clears the state.
 // ============================================================
+async function gracefulAutoLogout(user, state, now, reason) {
+  try {
+    // Close any open break so overbreak time is captured correctly
+    if (state.breakStart && state.breakType) {
+      const breakMins = minsBetween(new Date(state.breakStart), now);
+      const allowed   = state.breakType==='bbl' ? BBL_MINS
+                      : state.breakType==='lunch' ? LUNCH_MINS
+                      : state.breakType==='30' ? 30 : 15;
+      const over = breakMins - allowed - GRACE_MINS;
+      if (over > 0) {
+        if (state.breakType==='lunch' || state.breakType==='bbl')
+          state.overlunchMs = (state.overlunchMs||0) + over*60000;
+        else
+          state.overbreakMs = (state.overbreakMs||0) + over*60000;
+      }
+      // Record actual lunch time if applicable
+      if ((state.breakType==='lunch'||state.breakType==='bbl') && !state.lunchUsed) {
+        const actualLunch = Math.min(breakMins, LUNCH_MINS);
+        state.lunchUsed   = true;
+        state.lunchUsedMs = actualLunch * 60000;
+      }
+      state.breakStart = null;
+      state.breakType  = null;
+    }
+
+    // Only calculate hours if the user actually logged in
+    if (!state.loginTime || !state.shiftDate) return;
+
+    const result = calcPayable(user, state, now);
+    if (result.hours > 0 || result.ot > 0) {
+      await addCutoffHours(user.id, user.name, user.role, result.hours, result.ot);
+    }
+
+    // Finalize shift log
+    const existingLog = await getShiftLog(state.shiftDate, user.id) || {};
+    await setShiftLog(state.shiftDate, user.id, {
+      ...existingLog,
+      logoutTime:  now.toISOString(),
+      status:      'completed',
+      hours:       result.hours,
+      ot:          result.ot,
+      isLate:      state.isLate      || false,
+      lateMs:      state.lateMs      || 0,
+      overbreakMs: state.overbreakMs || 0,
+      overlunchMs: state.overlunchMs || 0,
+      lunchUsedMs: state.lunchUsedMs || 0,
+      breakUsed:   state.breakUsed   || 0,
+      bblUsed:     state.bblUsed     || false,
+      lunchUsed:   state.lunchUsed   || false,
+      events: [...(existingLog.events || []), { action:'auto-out', time:now.toISOString() }],
+    });
+
+    // Notify the user in Telegram
+    const hoursStr = result.hours.toFixed(2);
+    const otStr    = result.ot > 0 ? ` (+${result.ot.toFixed(2)}h OT)` : '';
+    await sendMsg(
+      `🔄 <b>Auto Log Out — ${user.name}</b>\nShift ended automatically (${reason}). Hours recorded: <b>${hoursStr}h${otStr}</b>. Contact your manager for disputes.`,
+      ALLOWED_CHAT, TOPIC_ID
+    );
+
+    await logToSheet(user.id, user.name, 'auto-out', now).catch(console.error);
+    console.log(`[Reset] Auto-logout ${user.name}: ${hoursStr}h${otStr}`);
+  } catch(e) {
+    console.error(`[Reset] gracefulAutoLogout failed for ${user.name}:`, e.message);
+  }
+}
 
 function getManilaHHMM() {
   const now = new Date();
@@ -1623,46 +1737,73 @@ function getManilaHHMM() {
 async function runDailyReset() {
   console.log('[Scheduler] Running daily reset (6PM Manila)');
   try {
+    const now    = new Date();
+    const roster = await getRoster();
+
+    // Step 1: Drop pending Telegram updates BEFORE touching states.
+    // This prevents stale /back or /out commands from replaying after states are cleared.
+    try {
+      await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+        url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
+      });
+      console.log('[Scheduler] Daily reset: drop_pending done');
+    } catch(e) { console.error('[Scheduler] Webhook drop_pending failed:', e.message); }
+
+    // Step 2: Gracefully close any open sessions before wiping state
     const keys = await redisKeys('state:*');
     for (const key of keys) {
+      const uid   = key.replace('state:','');
+      const user  = roster.find(u => u.id === uid);
+      const state = await getState(uid);
+      const activeStatuses = ['in','15','30','lunch','bbl','pre-shift','offset'];
+      if (user && activeStatuses.includes(state.status)) {
+        await gracefulAutoLogout(user, state, now, 'daily reset');
+      }
       await redisDel(key);
     }
-    console.log(`[Scheduler] Daily reset: cleared ${keys.length} states`);
+    console.log(`[Scheduler] Daily reset: closed and cleared ${keys.length} states`);
 
-    // Clear snapshot overrides — fresh shift day
+    // Step 3: Clear snapshot overrides — fresh shift day
     await clearAllSnapshotOverrides();
-
-    // Re-register webhook with drop_pending
-    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
-      url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
-    });
-    console.log('[Scheduler] Webhook refreshed');
+    console.log('[Scheduler] Daily reset complete');
   } catch(e) { console.error('[Scheduler] Daily reset error:', e.message); }
 }
 
 async function runCutoffReset() {
   console.log('[Scheduler] Running cutoff reset (9AM Manila)');
   try {
+    const now    = new Date();
     const roster = await getRoster();
 
-    for (const user of roster) {
-      // Check if today is the last day of their cutoff
-      if (!isLastCutoffDay(user.role)) continue;
+    // Step 1: Drop pending updates FIRST to prevent stale command replay
+    try {
+      await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+        url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
+      });
+      console.log('[Scheduler] Cutoff reset: drop_pending done');
+    } catch(e) { console.error('[Scheduler] Webhook drop_pending failed:', e.message); }
 
-      // Reset cutoff hours to 0
+    // Step 2: Gracefully close any open sessions — save hours before cutoff resets
+    const keys = await redisKeys('state:*');
+    for (const key of keys) {
+      const uid   = key.replace('state:','');
+      const user  = roster.find(u => u.id === uid);
+      const state = await getState(uid);
+      const activeStatuses = ['in','15','30','lunch','bbl','pre-shift','offset'];
+      if (user && activeStatuses.includes(state.status)) {
+        await gracefulAutoLogout(user, state, now, 'cutoff reset');
+      }
+      await redisDel(key);
+    }
+    console.log(`[Scheduler] Cutoff reset: closed and cleared ${keys.length} states`);
+
+    // Step 3: Reset cutoff hours for users whose cutoff ends today
+    for (const user of roster) {
+      if (!isLastCutoffDay(user.role)) continue;
       await resetCutoffForUser(user.id);
       console.log(`[Scheduler] Reset cutoff for ${user.name} (${user.role})`);
     }
 
-    // Also clear all states at cutoff reset
-    const keys = await redisKeys('state:*');
-    for (const key of keys) await redisDel(key);
-    console.log(`[Scheduler] Cutoff reset: cleared ${keys.length} states`);
-
-    // Refresh webhook
-    await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
-      url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
-    });
     console.log('[Scheduler] Cutoff reset complete');
   } catch(e) { console.error('[Scheduler] Cutoff reset error:', e.message); }
 }
@@ -1701,6 +1842,11 @@ setInterval(async () => {
     if (h === 18 && m === 0 && lastDailyReset !== dateStr) {
       const roster = await getRoster();
       const isCutoffDay = roster.some(u => isLastCutoffDay(u.role));
+      // Atomic lock — prevents double-fire if two instances somehow run
+      const lockKey = `lock:daily:${dateStr}`;
+      const r = await getRedis();
+      const locked = r ? await r.set(lockKey, '1', { NX:true, EX:120 }) : true;
+      if (!locked) { lastDailyReset = dateStr; return; } // another instance got there first
       lastDailyReset = dateStr;
       await saveLastResetDates();
       if (!isCutoffDay) {
@@ -1715,6 +1861,10 @@ setInterval(async () => {
       const roster = await getRoster();
       const hasCutoffToday = roster.some(u => isLastCutoffDay(u.role));
       if (hasCutoffToday) {
+        const lockKey = `lock:cutoff:${dateStr}`;
+        const r = await getRedis();
+        const locked = r ? await r.set(lockKey, '1', { NX:true, EX:120 }) : true;
+        if (!locked) { lastCutoffReset = dateStr; return; }
         lastCutoffReset = dateStr;
         await saveLastResetDates();
         await runCutoffReset();
@@ -1737,17 +1887,34 @@ app.get('/', (req, res) => res.json({
 // ============================================================
 // START
 // ============================================================
+// ============================================================
+// EXPRESS GLOBAL ERROR HANDLER
+// Catches any error that propagates up through next(err) or
+// from async route handlers that aren't individually wrapped.
+// Must be defined after all routes.
+// ============================================================
+app.use((err, req, res, next) => {
+  console.error('[EXPRESS ERROR]', req.method, req.path, err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+});
+
 app.listen(PORT, async () => {
   console.log(`10X VAs bot v3.1 on port ${PORT}`);
   await getRedis();
   await getRoster(); // seed roster if not exists
   await getLastResetDates(); // restore scheduler state — prevents accidental reset on redeploy
+
+  // Drop all pending Telegram updates accumulated during downtime BEFORE going live.
+  // Order: delete webhook → drop → re-register. This is the only sequence Telegram guarantees.
   try {
+    await axios.post(`https://api.telegram.org/bot${TOKEN}/deleteWebhook`, { drop_pending_updates: true });
+    console.log('Webhook deleted + pending dropped');
+    await new Promise(r => setTimeout(r, 1000)); // brief pause to let Telegram flush
     await axios.post(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
-      url: `${WEBHOOK_URL}/webhook`, drop_pending_updates: true,
+      url: `${WEBHOOK_URL}/webhook`,
     });
     console.log('Webhook registered');
-  } catch(e) { console.error('Webhook failed:', e.message); }
+  } catch(e) { console.error('Webhook setup failed:', e.message); }
 });
 
 // ============================================================
@@ -1756,9 +1923,10 @@ app.listen(PORT, async () => {
 
 // GET /me/:uid — returns user state for the mini app
 app.get('/me/:uid', async (req, res) => {
-  const uid  = req.params.uid;
-  const user = await getUserById(uid);
-  if (!user) return res.status(404).json({ error: 'User not found' });
+  try {
+    const uid  = req.params.uid;
+    const user = await getUserById(uid);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
   const state  = await getState(uid);
   const co     = await getCutoffHours(uid);
@@ -1822,20 +1990,24 @@ app.get('/me/:uid', async (req, res) => {
     cutoffEnd:    fmtDate(coDates.end),
     recentLogs,
   });
+  } catch(e) {
+    console.error('/me error:', e.message);
+    res.status(500).json({ error: 'User data unavailable', detail: e.message });
+  }
 });
 
 // POST /action — executes a command on behalf of the mini app user
 app.post('/action', async (req, res) => {
-  const { uid, action } = req.body;
-  if (!uid || !action) return res.status(400).json({ error: 'Missing uid or action' });
-
-  const user = await getUserById(uid);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-
-  const name = user.name;
-  let reply  = null;
-
   try {
+    const { uid, action } = req.body;
+    if (!uid || !action) return res.status(400).json({ error: 'Missing uid or action' });
+
+    const user = await getUserById(uid);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const name = user.name;
+    let reply  = null;
+
     if      (action === 'in')     reply = await handleIn(uid, name);
     else if (action === 'out')    reply = await handleOut(uid, name);
     else if (action === 'back')   reply = await handleBack(uid, name);
@@ -1845,7 +2017,6 @@ app.post('/action', async (req, res) => {
     else if (action === 'bbl')    reply = await handleBreak(uid, name, 'bbl');
     else return res.status(400).json({ error: 'Unknown action' });
 
-    // Strip HTML tags for clean mini app messages
     const clean = reply.replace(/<[^>]+>/g, '');
     res.json({ ok: true, message: clean });
   } catch(e) {

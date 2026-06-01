@@ -1270,7 +1270,8 @@ async function handleIn(uid, name, isOverride) {
   }
   await setWindow(uid, windowDate, newWr);
 
-  const newStatus = isEarly ? 'pre-shift' : 'in';
+  // Internal logins early = Pre-Shift OT (time before shift counts as OT)
+  const newStatus = isEarly ? (isInternal(user.role) ? 'pre-shift-ot' : 'pre-shift') : 'in';
   await setState(uid, {
     status: newStatus,
     loginTime: now.toISOString(),
@@ -1341,6 +1342,18 @@ async function handleOut(uid, name, isOverride, skipEarlyCheck) {
   const result = calcPayable(user, state, now);
   const windowDate = state.windowDate || getWindowDate();
   const wr = await getWindow(uid, windowDate) || newWindowRecord(uid, name, user.role, windowDate);
+
+  // Internal post-shift-ot: split into regular (shift) + OT (past shift end)
+  if (isInternal(user.role) && schedInfo && now > schedInfo.win.end) {
+    const otMs = Math.max(0, now - schedInfo.win.end);
+    const otMins = Math.floor((otMs / 60000) / OT_BLOCK_MINS()) * OT_BLOCK_MINS();
+    const otHours = Math.round((otMins / 60) * 100) / 100;
+    if (otHours > 0) {
+      result.ot = (result.ot || 0) + otHours;
+      result.hours = Math.max(0, Math.round((result.hours - otHours) * 100) / 100);
+      console.log(`[handleOut] Post-shift OT: ${name} ${otHours}h OT credited`);
+    }
+  }
 
   // Record session
   wr.sessions.push({ in: state.loginTime, out: now.toISOString(), hours: result.hours });
@@ -1893,9 +1906,27 @@ async function getDashboardData() {
         } else {
           status = 'pre-shift'; label = 'Pre-Shift';
         }
+      } else if (state.status === 'pre-shift-ot') {
+        // Internal: clocked in before shift start — all time is OT
+        if (state.shiftStart && now >= new Date(state.shiftStart)) {
+          status = 'active'; label = 'Active';
+          try {
+            const otStart = new Date(state.loginTime);
+            const otEndTime = new Date(state.shiftStart);
+            const otMins = Math.max(0, minsBetween(otStart, otEndTime));
+            const otBlocks = Math.floor(otMins / OT_BLOCK_MINS());
+            const otHours = Math.round(otBlocks * 0.5 * 100) / 100;
+            if (otHours > 0) await addCutoffHours(user.id, user.role, 0, otHours);
+            await setState(user.id, { ...state, status: 'in', preShiftOT: otHours });
+          } catch(e) {}
+        } else {
+          status = 'pre-shift-ot'; label = 'Pre-Shift OT';
+        }
       } else if (state.status === 'in') {
-        if (state.isLate) { status = 'late-in'; label = 'Late In'; }
-        else if ((state.overbreakMs || 0) > 0 || (state.overlunchMs || 0) > 0) { status = 'active'; label = 'Active'; }
+        // Detect post-shift OT for Internal: still logged in, past shift end
+        if (isInternal(user.role) && schedInfo && now > schedInfo.win.end) {
+          status = 'post-shift-ot'; label = 'Post-Shift OT';
+        } else if (state.isLate) { status = 'late-in'; label = 'Late In'; }
         else { status = 'active'; label = 'Active'; }
       } else if (state.status === 'break') {
         const elapsed = state.breakStart ? minsBetween(new Date(state.breakStart), now) : 0;
@@ -1927,6 +1958,18 @@ async function getDashboardData() {
       }
     }
     } // close adminOverride else block
+
+    // Live hours for pre-shift-ot (no regular hours, OT accumulating)
+    if (status === 'pre-shift-ot' && state.loginTime) {
+      productiveHours = 0; // regular hours start at shift start
+    }
+    // Live hours for post-shift-ot (regular hours capped at shift length)
+    if (status === 'post-shift-ot' && state.loginTime && schedInfo) {
+      const login = new Date(state.loginTime);
+      const effLogin = login > schedInfo.win.start ? login : schedInfo.win.start;
+      const shiftMs = Math.max(0, schedInfo.win.end - effLogin);
+      productiveHours = Math.min(Math.round((shiftMs / 3600000) * 100) / 100, MAX_SHIFT_HRS());
+    }
 
     // Calculate live productive hours for active users
     if (['active', 'late-in', 'break', 'overbreak', 'lunch', 'overlunch', 'bbl', 'bio', 'excessive-bio'].includes(status) && state.loginTime) {
@@ -2016,7 +2059,7 @@ async function getDashboardData() {
   }
 
   // Sort: Missing first, then active statuses, then offline
-  const ORDER = { missing:0, 'excessive-bio':1, overbreak:2, overlunch:3, 'late-in':4, bio:5, break:6, lunch:7, bbl:8, active:9, 'pre-shift':10, offset:11, ot:12, holiday:13, leave:14, vto:15, absent:16, done:17, dayoff:18, offline:19 };
+  const ORDER = { missing:0, 'excessive-bio':1, overbreak:2, overlunch:3, 'late-in':4, bio:5, break:6, lunch:7, bbl:8, active:9, 'pre-shift':10, 'pre-shift-ot':10, 'post-shift-ot':9, offset:11, ot:12, holiday:13, leave:14, vto:15, absent:16, done:17, dayoff:18, offline:19 };
   users.sort((a, b) => (ORDER[a.status] ?? 20) - (ORDER[b.status] ?? 20));
 
   // Default cutoff display uses bi-weekly anchor (VA I/II/Admin/Internal)
@@ -2779,6 +2822,17 @@ app.get('/me/:uid', async (req, res) => {
       ['offset-in', 'ot-in'].includes(a.type) &&
       new Date(a.resolvedAt).toDateString() === new Date().toDateString());
 
+    // Real-time OT for Internal mini app — updates every poll cycle
+    let liveOT = 0;
+    if (isInternal(user.role) && state.loginTime) {
+      const nowMe = new Date();
+      if (state.status === 'pre-shift-ot') {
+        liveOT = Math.round(Math.max(0, (nowMe - new Date(state.loginTime)) / 3600000) * 100) / 100;
+      } else if ((state.status === 'in' || state.status === 'post-shift-ot') && schedInfo && nowMe > schedInfo.win.end) {
+        liveOT = Math.round(Math.max(0, (nowMe - schedInfo.win.end) / 3600000) * 100) / 100;
+      }
+    }
+
     res.json({
       id: user.id, name: user.name, role: user.role,
       state, cutoff: co, windowDate,
@@ -2790,6 +2844,7 @@ app.get('/me/:uid', async (req, res) => {
       pendingApprovals,
       approvedPermissions,
       cutoffEnd: getCutoffDates(user.role) ? fmtDate(getCutoffDates(user.role).end) : '',
+      liveOT: Math.round(liveOT * 100) / 100,
     });
   } catch(e) { console.error('/me error:', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -3800,9 +3855,23 @@ setInterval(async () => {
         if (!user) continue;
         const now = new Date();
 
-        // Pre-shift → Active
+        // Pre-shift → Active (non-Internal)
         if (state.status === 'pre-shift' && state.shiftStart && now >= new Date(state.shiftStart)) {
           await setState(uid, { ...state, status: 'in' });
+        }
+
+        // Internal pre-shift-ot → Active when shift starts; credit accumulated OT
+        if (state.status === 'pre-shift-ot' && state.shiftStart && now >= new Date(state.shiftStart)) {
+          const otStart = new Date(state.loginTime);
+          const otEndTime = new Date(state.shiftStart);
+          const otMins = Math.max(0, minsBetween(otStart, otEndTime));
+          const otBlocks = Math.floor(otMins / OT_BLOCK_MINS());
+          const otHours = Math.round(otBlocks * 0.5 * 100) / 100;
+          if (otHours > 0) {
+            await addCutoffHours(uid, user.role, 0, otHours);
+            console.log(`[Scheduler] Pre-shift OT credited: ${user.name} ${otHours}h`);
+          }
+          await setState(uid, { ...state, status: 'in', preShiftOT: otHours });
         }
 
         // OT auto-stop at shift boundary

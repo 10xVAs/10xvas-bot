@@ -2042,6 +2042,16 @@ async function getDashboardData() {
       if (wr.adminOverrides.hours !== undefined) productiveHours = parseFloat(wr.adminOverrides.hours) || 0;
     }
 
+    // Calculate real-time OT for Internal (pre-shift or post-shift)
+    let liveOT = 0;
+    if (isInternal(user.role) && state.loginTime) {
+      if (status === 'pre-shift-ot') {
+        liveOT = Math.round(Math.max(0, (now - new Date(state.loginTime)) / 3600000) * 100) / 100;
+      } else if ((status === 'post-shift-ot' || status === 'active') && schedInfo && now > schedInfo.win.end) {
+        liveOT = Math.round(Math.max(0, (now - schedInfo.win.end) / 3600000) * 100) / 100;
+      }
+    }
+
     users.push({
       id: user.id, name: user.name, role: user.role,
       status, statusLabel: label,
@@ -2049,6 +2059,7 @@ async function getDashboardData() {
       scheduleClientSet: schedInfo?.sched?.clientSet === true,
       productiveHours: Math.round(productiveHours * 100) / 100,
       cutoffHours: co.hours, cutoffOT: co.ot,
+      liveOT,
       cutoffEnd: getCutoffDates(user.role) ? fmtDate(getCutoffDates(user.role).end) : '',
       loginTime,   // ← uses computed fallback chain (state → firstLoginTime → sessions[0].in)
       logoutTime,

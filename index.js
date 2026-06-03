@@ -639,7 +639,31 @@ function getCutoffDates(role) {
 function isLastCutoffDay(role) {
   const dates = getCutoffDates(role);
   if (!dates) return false; // C6: no-payroll roles never trigger cutoff jobs
-  return manilaDateStr() === manilaDateStr(dates.end);
+  // The period END time is exactly when the new period starts (e.g., 9AM Manila).
+  // At the reset moment (9AM), getCutoffDates() already returns the NEW period,
+  // so dates.end is no longer today — it's 14 days in the future.
+  // Fix: check if the current Manila date matches the END date of the PREVIOUS period.
+  // We do this by subtracting one period interval and checking that period's end.
+  const now = new Date();
+  if (role === 'UYP') {
+    // For UYP, check if today is the 15th or last day of the month (semi-monthly boundary)
+    const s = manilaDateStr(now).split('-');
+    const y = +s[0], m = +s[1], d = +s[2];
+    const last = new Date(y, m, 0).getDate();
+    return d === 15 || d === last;
+  }
+  // For bi-weekly: check if today matches any period boundary (start of new period = end of old)
+  const interval = VA_CUTOFF_DAYS() * 86400000;
+  const anchor = VA_CUTOFF_ANCHOR();
+  // How many ms since anchor?
+  const elapsed = now.getTime() - anchor;
+  // Which millisecond within the current period?
+  const withinPeriod = ((elapsed % interval) + interval) % interval;
+  // It's a cutoff day if we're within the first 24 hours of a new period
+  // (i.e., the day the period started = the day the old period ended)
+  const manilaToday = manilaDateStr(now);
+  const periodStart = new Date(anchor + Math.floor(elapsed / interval) * interval);
+  return manilaToday === manilaDateStr(periodStart);
 }
 
 // Expected hours for a user within their current cutoff (for offset missing hours calc)
@@ -1355,7 +1379,8 @@ async function handleOut(uid, name, isOverride, skipEarlyCheck) {
     }
   }
 
-  // Record session
+  // Record session — also persist logoutTime on window record so PG logout_time column is set
+  wr.logoutTime = now.toISOString();
   wr.sessions.push({ in: state.loginTime, out: now.toISOString(), hours: result.hours });
   wr.totalHours = Math.round((wr.totalHours + result.hours) * 100) / 100;
   wr.breakUsed = state.breakUsed || wr.breakUsed;
@@ -2432,6 +2457,49 @@ function parseTimeOverride(input) {
   // Anything else — try parsing, return null if invalid
   const d = new Date(input);
   return isNaN(d) ? null : d.toISOString();
+}
+
+// Snapshot DB — read historical snapshots from daily_snapshots table
+// Returns data for a specific date range (default: last 90 days)
+app.get('/admin/snapshots', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  try {
+    const days = parseInt(req.query.days) || 90;
+    const rows = await pgQuery(
+      `SELECT window_date, user_id, user_name, user_role, status, status_label,
+              shift_start, shift_end, hours, cutoff_hours, cutoff_ot, created_at
+       FROM daily_snapshots
+       WHERE window_date >= CURRENT_DATE - INTERVAL '${days} days'
+       ORDER BY window_date DESC, user_role, user_name`,
+    );
+    // Group by date
+    const byDate = {};
+    for (const r of rows) {
+      const d = r.window_date instanceof Date
+        ? r.window_date.toISOString().split('T')[0]
+        : String(r.window_date);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push({
+        userId: r.user_id, name: r.user_name, role: r.user_role,
+        status: r.status, statusLabel: r.status_label,
+        shiftStart: r.shift_start, shiftEnd: r.shift_end,
+        hours: parseFloat(r.hours)||0,
+        cutoffHours: parseFloat(r.cutoff_hours)||0,
+        cutoffOT: parseFloat(r.cutoff_ot)||0,
+      });
+    }
+    res.json({ dates: Object.keys(byDate).sort().reverse(), data: byDate });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Auto-purge daily_snapshots older than 90 days (runs at startup + daily)
+async function purgeOldSnapshots() {
+  try {
+    const r = await pgQuery(
+      `DELETE FROM daily_snapshots WHERE window_date < CURRENT_DATE - INTERVAL '90 days'`
+    );
+    if (r && r.rowCount > 0) console.log(`[Snapshots] Purged ${r.rowCount} rows older than 90 days`);
+  } catch(e) { console.error('[Snapshots] Purge error:', e.message); }
 }
 
 app.post('/admin/snapshot/override', async (req, res) => {
@@ -3735,13 +3803,26 @@ async function runCutoffReset() {
       ).catch(e => console.error('[PG] kpi_archive insert:', user.name, e.message));
     }
 
-    // Reset cutoff hours and clear window records (so double-shift prevention allows re-login)
+    // Reset cutoff hours and clear window records
     const windowDate = getWindowDate(manilaTime());
     for (const user of roster) {
       if (!isLastCutoffDay(user.role)) continue;
-      await setCutoff(user.id, { hours: 0, ot: 0 });
+
+      // Zero out cutoff directly in Postgres for ALL periods belonging to this user
+      // that started BEFORE today (the old period). This is safer than setCutoff()
+      // which always writes the CURRENT period (already rolled over at reset time).
+      const todayStr = manilaDateStr();
+      await pgQuery(
+        `UPDATE cutoff_periods SET hours_logged=0, ot_hours=0, updated_at=now()
+         WHERE user_id=$1 AND period_start < $2`,
+        [String(user.id), todayStr]
+      ).catch(e => console.error(`[PG] cutoff zero fail ${user.name}:`, e.message));
+
+      // Also clear Redis cutoff cache for this user (all period-scoped keys)
+      const ckeys = await rKeys(`cutoff:${user.id}:*`).catch(() => []);
+      for (const ck of ckeys) await rDel(ck).catch(() => {});
+
       // C3 fix: clear BOTH Redis and Postgres shift window record
-      // Without clearing Postgres, getWindow() returns the old record and VAs hit double-shift block
       await rDel(`shiftwindow:${user.id}:${windowDate}`);
       await pgQuery(
         `DELETE FROM shift_sessions WHERE user_id=$1 AND window_date=$2`,
@@ -3947,6 +4028,8 @@ app.listen(PORT, async () => {
 
   // Load config from Postgres BEFORE doing anything else (so role checks use truth)
   await refreshConfigCache(true);
+  // Purge snapshots older than 90 days
+  purgeOldSnapshots().catch(()=>{});
   console.log(`[CONFIG] Loaded ${Object.keys(_configCache).length} system keys, ${Object.keys(_roleCache).length} roles`);
 
   // Auto-refresh config every 60s in case admin edits role_config or system_config

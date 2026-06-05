@@ -3108,6 +3108,8 @@ async function getTask(id) {
         assignedTo: assignments.map(r => r.va_id),
         notes: notes.map(n => ({ author: n.author, authorType: n.author_type, text: n.text, time: n.created_at })),
         clientId: task.client_id, clientName: task.client_name,
+        fromId: task.from_id, fromType: task.from_type,
+        toId: task.to_id, toType: task.to_type,
         deadlineRaw: task.deadline_raw, deadlineTz: task.deadline_tz,
         createdAt: task.created_at, updatedAt: task.updated_at,
       };
@@ -3121,14 +3123,18 @@ async function saveTask(t) {
   await rSet(`task:${t.id}`, JSON.stringify(t)).catch(()=>{});
   try {
     await pgQuery(
-      `INSERT INTO tasks (id,client_id,client_name,title,description,priority,status,deadline,deadline_raw,deadline_tz,created_at,updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `INSERT INTO tasks (id,client_id,client_name,title,description,priority,status,deadline,deadline_raw,deadline_tz,
+         from_type,from_id,to_type,to_id,created_at,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        ON CONFLICT (id) DO UPDATE SET
-         title=$4,description=$5,priority=$6,status=$7,deadline=$8,deadline_raw=$9,deadline_tz=$10,updated_at=now()`,
-      [t.id, t.clientId, t.clientName, t.title, t.description||'',
+         title=$4,description=$5,priority=$6,status=$7,deadline=$8,deadline_raw=$9,deadline_tz=$10,
+         from_type=$11,from_id=$12,to_type=$13,to_id=$14,updated_at=now()`,
+      [t.id, t.clientId||t.fromId||null, t.clientName||null, t.title, t.description||'',
        t.priority||'medium', t.status||'new',
        t.deadline ? new Date(t.deadline) : null,
        t.deadlineRaw||null, t.deadlineTz||'Asia/Manila',
+       t.fromType||'client', t.fromId||t.clientId||null,
+       t.toType||'user', t.toId||null,
        new Date(t.createdAt||Date.now()), new Date(t.updatedAt||Date.now())]
     );
     await pgQuery('DELETE FROM task_assignments WHERE task_id=$1', [t.id]);
@@ -3147,56 +3153,81 @@ async function saveTask(t) {
 // Create task
 app.post('/task', async (req, res) => {
   try {
-    const { clientId, assignedTo, title, description, priority, deadline, clientTimezone } = req.body;
-    if (!clientId || !title || !assignedTo?.length) return res.status(400).json({ error: 'Missing required fields' });
-    const clients = await getClients();
-    const client = clients.find(c => c.telegramId === clientId || c.id === clientId);
-    if (!client) return res.status(404).json({ error: 'Client not found' });
-    const clientName = client.firstName ? `${client.firstName} ${client.lastName}` : client.name || 'Client';
-    const tz = clientTimezone || client.timezone || 'Asia/Manila';
+    // Supports bidirectional tasks:
+    //   clientId + assignedTo = legacy Client→VA format (still works)
+    //   fromId + fromType + toId + toType + assignedTo = new generalized format
+    const { clientId, assignedTo, title, description, priority, deadline, clientTimezone,
+            fromId, fromType, toId, toType } = req.body;
+    if (!title) return res.status(400).json({ error: 'title required' });
 
-    // Normalize deadline: client picked "2026-05-30" in their timezone — interpret as EOD in that timezone
+    // Resolve the "from" side
+    let resolvedFromId   = fromId || clientId;
+    let resolvedFromType = fromType || 'client';
+    let resolvedFromName = '';
+
+    if (!resolvedFromId) return res.status(400).json({ error: 'fromId or clientId required' });
+
+    // Look up the from-person's name
+    if (resolvedFromType === 'client' || resolvedFromType === 'owner') {
+      const clients = await getClients();
+      const c = clients.find(x => x.telegramId === resolvedFromId || x.id === resolvedFromId);
+      resolvedFromName = c ? (c.firstName ? `${c.firstName} ${c.lastName||''}`.trim() : c.name) : resolvedFromId;
+    } else {
+      const roster = await getRoster();
+      const u = roster.find(x => x.id === resolvedFromId);
+      resolvedFromName = u?.name || resolvedFromId;
+    }
+
+    // Resolve timezone
+    const tz = clientTimezone || 'Asia/Manila';
+
+    // Normalize deadline
     let normalizedDeadline = null;
     if (deadline) {
       try {
-        // "2026-05-30" → EOD that day in client TZ → ISO string
         const eod = new Date(`${deadline}T23:59:59`);
-        // Adjust for the difference between local interpretation and intended timezone
         const intendedInTz = new Date(eod.toLocaleString('en-US', { timeZone: tz }));
         const intendedLocal = new Date(eod.toLocaleString('en-US'));
         const diff = intendedInTz - intendedLocal;
-        const adjusted = new Date(eod.getTime() - diff);
-        normalizedDeadline = adjusted.toISOString();
-      } catch(e) {
-        normalizedDeadline = deadline; // Fallback to raw string
-      }
+        normalizedDeadline = new Date(eod.getTime() - diff).toISOString();
+      } catch(e) { normalizedDeadline = deadline; }
     }
 
     const id = 'task_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const assignees = Array.isArray(assignedTo) ? assignedTo : (assignedTo ? [assignedTo] : (toId ? [toId] : []));
+
     const task = {
-      id, clientId: client.telegramId || client.id, clientName,
-      assignedTo: Array.isArray(assignedTo) ? assignedTo : [assignedTo],
+      id,
+      clientId: resolvedFromType === 'client' ? resolvedFromId : null,
+      clientName: resolvedFromName,
+      fromId: resolvedFromId, fromType: resolvedFromType,
+      toId: toId || assignees[0] || null, toType: toType || 'user',
+      assignedTo: assignees,
       title, description: description || '', priority: priority || 'medium',
       deadline: normalizedDeadline, deadlineRaw: deadline || null, deadlineTz: tz,
       status: 'new',
       notes: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
-    await saveTask(task);
-    const idx = await getTaskIndex();
-    idx.push(id);
-    await saveTaskIndex(idx);
 
-    // Notify assigned VAs via DM
+    // Save using enhanced saveTask (will write from_id/to_id columns)
+    await saveTask(task);
+
+    // Notify assignees via DM
     const roster = await getRoster();
     for (const vaId of task.assignedTo) {
       const va = roster.find(u => u.id === vaId);
       if (va) {
         const pIcon = { high: '🔴', medium: '🟡', low: '🟢' }[task.priority] || '⚪';
-        await sendDM(vaId, `📋 <b>New Task from ${clientName}</b>\n${pIcon} ${task.priority.toUpperCase()}\n\n<b>${task.title}</b>\n${task.description || 'No description'}\n${task.deadline ? `📅 Due: ${task.deadline}` : ''}`).catch(e => console.error(`Task DM fail ${vaId}:`, e.message));
+        await sendDM(vaId, `📋 <b>New Task from ${resolvedFromName}</b>\n${pIcon} ${task.priority.toUpperCase()}\n\n<b>${task.title}</b>\n${task.description || 'No description'}\n${task.deadline ? `📅 Due: ${task.deadlineRaw}` : ''}`).catch(e => console.error(`Task DM fail ${vaId}:`, e.message));
       }
     }
 
-    await logEdit(clientId, 'Client', 'task-create', task.id, null, { title: task.title, assignedTo: task.assignedTo, priority: task.priority });
+    // If task is assigned to a client or owner, DM them too
+    if (toId && !task.assignedTo.includes(toId)) {
+      await sendDM(toId, `📋 <b>New Task from ${resolvedFromName}</b>\n\n<b>${task.title}</b>\n${task.description || 'No description'}`).catch(()=>{});
+    }
+
+    await logEdit(resolvedFromId, resolvedFromType, 'task-create', task.id, null, { title: task.title, assignedTo: task.assignedTo, priority: task.priority });
     res.json({ ok: true, task });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -3480,40 +3511,84 @@ app.get('/admin/financials-summary', async (req, res) => {
   try {
     const roster = await getRoster();
     const clients = await getClients();
-    // Calculate income from clients
-    let totalIncome = 0;
+    const payingClients = clients.filter(c => !c.role || c.role === 'Client');
+
+    // Counts
+    const vaICount  = roster.filter(u => u.role === 'VA I').length;
+    const vaIICount = roster.filter(u => u.role === 'VA II').length;
+    const ghlCount  = payingClients.filter(c => c.ghlSubscription).length;
+
+    // Revenue breakdown
+    let revenueFromVAs = 0, revenueFromGHL = 0, affiliatePayoutTotal = 0;
     const clientSummary = [];
-    for (const client of clients) {
+    for (const client of payingClients) {
       const vaRates = (client.assignedVAs || []);
-      let clientTotal = 0;
+      let clientVARevenue = 0;
       const vas = [];
       for (const va of vaRates) {
         const vaId = typeof va === 'object' ? va.id : va;
         const vaRate = typeof va === 'object' ? (va.rate || 0) : 0;
-        clientTotal += vaRate;
+        clientVARevenue += vaRate;
         const rUser = roster.find(u => u.id === vaId);
-        vas.push({ id: vaId, name: rUser?.name || vaId, rate: vaRate });
+        vas.push({ id: vaId, name: rUser?.name || vaId, role: rUser?.role || '', rate: vaRate });
       }
-      const ghlRate = client.ghlSubscription ? (client.ghlRate || 0) : 0;
-      clientTotal += ghlRate;
-      const affiliateRate = client.affiliateRate || 0;
-      totalIncome += clientTotal;
+      const ghlRate = client.ghlSubscription ? (parseFloat(client.ghlRate) || 0) : 0;
+      const affiliateRate = parseFloat(client.affiliateRate) || 0;
+      revenueFromVAs += clientVARevenue;
+      revenueFromGHL += ghlRate;
+      affiliatePayoutTotal += affiliateRate;
+
+      // Calculate next due date from billing_frequency + start_date
+      let nextDue = null;
+      if (client.startDate || client.start_date) {
+        const startStr = client.startDate || client.start_date;
+        const freq = client.billingFrequency || client.billing_frequency || 'monthly';
+        const start = new Date(startStr);
+        if (!isNaN(start)) {
+          const now = new Date();
+          let cursor = new Date(start);
+          while (cursor <= now) {
+            if (freq === 'monthly') cursor.setMonth(cursor.getMonth() + 1);
+            else cursor.setDate(cursor.getDate() + 28); // 28-day
+          }
+          nextDue = cursor.toISOString().split('T')[0];
+        }
+      }
+
       clientSummary.push({
         id: client.id || client.telegramId,
-        name: client.firstName ? `${client.firstName} ${client.lastName}` : client.name,
-        businessName: client.businessName,
+        name: client.firstName ? `${client.firstName} ${client.lastName||''}`.trim() : client.name,
+        businessName: client.businessName || client.company || '',
+        logo: client.logo || null,
         vas, ghlRate, affiliateRate,
-        totalRate: clientTotal,
-        billingFrequency: client.billingFrequency || 'monthly',
+        vaRevenue: clientVARevenue,
+        totalRate: clientVARevenue + ghlRate,
+        billingFrequency: client.billingFrequency || client.billing_frequency || 'monthly',
+        nextDue,
+        hasFeedback: false, // will be overridden below
       });
     }
 
-    // Calculate payroll from roster using staff_rates from Postgres
+    // Check for recent feedback per client
+    try {
+      const recentFb = await pgQuery(
+        `SELECT client_id, count(*) as cnt FROM feedback WHERE status='new' GROUP BY client_id`
+      );
+      for (const fb of recentFb) {
+        const cs = clientSummary.find(c => c.id === fb.client_id);
+        if (cs) { cs.hasFeedback = true; cs.feedbackCount = parseInt(fb.cnt); }
+      }
+    } catch(e) {}
+
+    const totalRevenue = revenueFromVAs + revenueFromGHL;
+    const profit = totalRevenue - affiliatePayoutTotal;
+
+    // Payroll from roster
     let totalPayroll = 0;
     const staffSummary = [];
     const fin = await getFinancials();
     for (const user of roster) {
-      if (!hasCutoff(user.role)) continue; // skip Owner/Director
+      if (!hasCutoff(user.role)) continue;
       const co = await getCutoff(user.id);
       const rates = fin.rates[user.id] || { rate: 0, otRate: 0 };
       const regularPay = co.hours * (rates.rate || 0);
@@ -3525,14 +3600,296 @@ app.get('/admin/financials-summary', async (req, res) => {
         cutoffHours: co.hours, cutoffOT: co.ot,
         rate: rates.rate || 0, otRate: rates.otRate || 0,
         regularPay: Math.round(regularPay * 100) / 100,
-        otPay:      Math.round(otPay      * 100) / 100,
-        totalPay:   Math.round(totalPay   * 100) / 100,
-        currency:   fin.currency || 'USD',
+        otPay: Math.round(otPay * 100) / 100,
+        totalPay: Math.round(totalPay * 100) / 100,
+        currency: fin.currency || 'USD',
       });
     }
     totalPayroll = Math.round(totalPayroll * 100) / 100;
 
-    res.json({ totalIncome, totalPayroll, clientSummary, staffSummary, currency: fin.currency || 'USD' });
+    res.json({
+      // Totals
+      totalRevenue: Math.round(totalRevenue * 100) / 100,
+      revenueFromVAs: Math.round(revenueFromVAs * 100) / 100,
+      revenueFromGHL: Math.round(revenueFromGHL * 100) / 100,
+      affiliatePayoutTotal: Math.round(affiliatePayoutTotal * 100) / 100,
+      profit: Math.round(profit * 100) / 100,
+      totalPayroll,
+      // Counts
+      totalClients: payingClients.length,
+      vaICount, vaIICount, ghlCount,
+      // Details
+      clientSummary, staffSummary,
+      currency: fin.currency || 'USD',
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════
+// §33 FIRES — issue tracking with comments
+// ════════════════════════════════════════════════════════════
+
+app.post('/fires', async (req, res) => {
+  try {
+    const { authorId, authorName, authorRole, title, description } = req.body;
+    if (!authorId || !title) return res.status(400).json({ error: 'authorId and title required' });
+    const id = 'fire_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    await pgQuery(
+      `INSERT INTO fires (id, author_id, author_name, author_role, title, description, status)
+       VALUES ($1,$2,$3,$4,$5,$6,'open')`,
+      [id, authorId, authorName || '', authorRole || '', title, description || '']
+    );
+    await logEdit(authorId, authorRole || 'unknown', 'fire-create', id, null, { title });
+    // Notify management
+    await notifyManagement(`🔥 <b>New Fire</b>\nFrom: ${authorName || authorId}\n\n<b>${title}</b>\n${description || ''}`);
+    res.json({ ok: true, id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/fires', async (req, res) => {
+  try {
+    const { userId, status } = req.query;
+    let sql = 'SELECT * FROM fires';
+    const params = [];
+    const conditions = [];
+    if (userId) { conditions.push(`author_id=$${params.length+1}`); params.push(userId); }
+    if (status) { conditions.push(`status=$${params.length+1}`); params.push(status); }
+    if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY created_at DESC LIMIT 100';
+    const fires = await pgQuery(sql, params);
+    // Attach comment count
+    for (const f of fires) {
+      const cc = await pgOne('SELECT count(*)::int as cnt FROM fire_comments WHERE fire_id=$1', [f.id]);
+      f.commentCount = cc?.cnt || 0;
+    }
+    res.json(fires);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/fires/:id', async (req, res) => {
+  try {
+    const fire = await pgOne('SELECT * FROM fires WHERE id=$1', [req.params.id]);
+    if (!fire) return res.status(404).json({ error: 'Not found' });
+    const comments = await pgQuery(
+      'SELECT * FROM fire_comments WHERE fire_id=$1 ORDER BY created_at ASC', [req.params.id]
+    );
+    res.json({ ...fire, comments });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/fires/:id/comment', async (req, res) => {
+  try {
+    const { authorId, authorName, authorRole, text } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    await pgQuery(
+      `INSERT INTO fire_comments (fire_id, author_id, author_name, author_role, text)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [req.params.id, authorId || '', authorName || '', authorRole || '', text]
+    );
+    await pgQuery('UPDATE fires SET updated_at=now() WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/fires/:id/status', async (req, res) => {
+  try {
+    const { status, resolvedBy } = req.body;
+    if (!['open', 'paused', 'resolved'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const before = await pgOne('SELECT status FROM fires WHERE id=$1', [req.params.id]);
+    await pgQuery(
+      `UPDATE fires SET status=$1, resolved_by=$2,
+       resolved_at=${status === 'resolved' ? 'now()' : 'NULL'},
+       updated_at=now() WHERE id=$3`,
+      [status, resolvedBy || null, req.params.id]
+    );
+    await logEdit(resolvedBy || 'admin', 'Admin', 'fire-status', req.params.id, before, { status });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════
+// §34 DAY PLANNER — 30-min blocks, Postgres primary
+// ════════════════════════════════════════════════════════════
+
+app.get('/planner/:userId/:date', async (req, res) => {
+  try {
+    const rows = await pgQuery(
+      `SELECT time_slot, label, color, set_by_id, set_by_name
+       FROM day_planner WHERE user_id=$1 AND plan_date=$2
+       ORDER BY time_slot`,
+      [req.params.userId, req.params.date]
+    );
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/planner/:userId/:date', async (req, res) => {
+  try {
+    const { slots, setById, setByName } = req.body;
+    // slots = [{ time: '09:00', label: 'Lead gen', color: '#0D7C5F' }, ...]
+    if (!Array.isArray(slots)) return res.status(400).json({ error: 'slots array required' });
+    // Delete existing slots for this user+date, then insert new
+    await pgQuery('DELETE FROM day_planner WHERE user_id=$1 AND plan_date=$2',
+      [req.params.userId, req.params.date]);
+    for (const s of slots) {
+      if (!s.time) continue;
+      await pgQuery(
+        `INSERT INTO day_planner (set_by_id, set_by_name, user_id, plan_date, time_slot, label, color)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [setById || '', setByName || '', req.params.userId, req.params.date,
+         s.time, s.label || '', s.color || '#0D7C5F']
+      );
+    }
+    res.json({ ok: true, count: slots.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════
+// §35 BIDIRECTIONAL TASKS — generalized task queries
+// ════════════════════════════════════════════════════════════
+
+// Tasks created BY a person (from_id)
+app.get('/tasks/by/:uid', async (req, res) => {
+  try {
+    const rows = await pgQuery(
+      `SELECT t.id FROM tasks t WHERE t.from_id=$1 ORDER BY t.created_at DESC`,
+      [req.params.uid]
+    );
+    const tasks = [];
+    for (const r of rows) { const t = await getTask(r.id); if (t) tasks.push(t); }
+    res.json(tasks);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Tasks assigned TO a person (to_id or in task_assignments)
+app.get('/tasks/for/:uid', async (req, res) => {
+  try {
+    const rows = await pgQuery(
+      `SELECT DISTINCT t.id FROM tasks t
+       LEFT JOIN task_assignments ta ON ta.task_id = t.id
+       WHERE t.to_id=$1 OR ta.va_id=$1
+       ORDER BY t.id DESC`,
+      [req.params.uid]
+    );
+    const tasks = [];
+    for (const r of rows) { const t = await getTask(r.id); if (t) tasks.push(t); }
+    res.json(tasks);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// All tasks visible to internal team (all tasks with from_type='owner' or 'internal')
+app.get('/tasks/internal', async (req, res) => {
+  try {
+    const { userId } = req.query; // optional filter by assignee
+    let sql = `SELECT DISTINCT t.id FROM tasks t
+       LEFT JOIN task_assignments ta ON ta.task_id = t.id
+       WHERE (t.from_type IN ('owner','internal') OR t.to_type IN ('owner','internal'))`;
+    const params = [];
+    if (userId) { sql += ` AND (ta.va_id=$1 OR t.to_id=$1 OR t.from_id=$1)`; params.push(userId); }
+    sql += ' ORDER BY t.id DESC LIMIT 200';
+    const rows = await pgQuery(sql, params);
+    const tasks = [];
+    for (const r of rows) { const t = await getTask(r.id); if (t) tasks.push(t); }
+    res.json(tasks);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// User/VA submits feedback (previously client-only)
+app.post('/user/feedback', async (req, res) => {
+  try {
+    const { userId, userName, userRole, type, message } = req.body;
+    if (!userId || !message) return res.status(400).json({ error: 'Missing fields' });
+    const fbId = `fb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await pgQuery(
+      `INSERT INTO feedback (id, client_id, client_name, business_name, type, message, status, submitter_type, submitter_id)
+       VALUES ($1, $2, $3, '', $4, $5, 'new', $6, $7)`,
+      [fbId, userId, userName || userId, type || 'feedback', message, userRole === 'Internal' ? 'internal' : 'user', userId]
+    );
+    await notifyManagement(`📩 <b>${type === 'support' ? 'Support Request' : 'Feedback'}</b>\nFrom: ${userName || userId} (${userRole || 'User'})\n\n${message}`);
+    await logEdit(userId, userRole || 'User', `feedback-${type}`, userName, null, { fbId });
+    res.json({ ok: true, fbId });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get feedback filtered by type and/or submitter
+app.get('/feedback', async (req, res) => {
+  try {
+    const { type, submitterType } = req.query;
+    let sql = `SELECT id, client_id as "clientId", client_name as "clientName",
+              business_name as "businessName", type, message, status, submitter_type as "submitterType",
+              submitter_id as "submitterId", resolved_at as "resolvedAt", created_at as "createdAt"
+       FROM feedback`;
+    const conditions = [], params = [];
+    if (type) { conditions.push(`type=$${params.length+1}`); params.push(type); }
+    if (submitterType) { conditions.push(`submitter_type=$${params.length+1}`); params.push(submitterType); }
+    if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY created_at DESC LIMIT 200';
+    const rows = await pgQuery(sql, params);
+    res.json({ items: rows, total: rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Approvals with date filter (for history within cutoff)
+app.get('/approvals', async (req, res) => {
+  try {
+    const { status, since } = req.query;
+    let sql = `SELECT * FROM approvals`;
+    const conditions = [], params = [];
+    if (status) { conditions.push(`status=$${params.length+1}`); params.push(status); }
+    if (since) { conditions.push(`created_at >= $${params.length+1}`); params.push(since); }
+    if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY created_at DESC LIMIT 200';
+    const rows = await pgQuery(sql, params);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Client-scoped dashboard (only their assigned VAs)
+app.get('/client/:clientId/dashboard', async (req, res) => {
+  try {
+    const clients = await getClients();
+    const client = clients.find(c => c.id === req.params.clientId || c.telegramId === req.params.clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    const assignedIds = (client.assignedVAs || []).map(v => typeof v === 'object' ? v.id : v);
+    const data = await getDashboardData();
+    const vaUsers = data.users.filter(u => assignedIds.includes(u.id));
+
+    res.json({
+      timestamp: data.timestamp, date: data.date,
+      clientName: client.firstName ? `${client.firstName} ${client.lastName||''}`.trim() : client.name,
+      businessName: client.businessName || client.company || '',
+      users: vaUsers,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Client sets VA schedule
+app.put('/client/schedule/:vaId', async (req, res) => {
+  try {
+    const { schedules, clientId } = req.body;
+    if (!Array.isArray(schedules)) return res.status(400).json({ error: 'schedules array required' });
+
+    // Verify this VA is assigned to this client
+    const clients = await getClients();
+    const client = clients.find(c => c.id === clientId || c.telegramId === clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    const assignedIds = (client.assignedVAs || []).map(v => typeof v === 'object' ? v.id : v);
+    if (!assignedIds.includes(req.params.vaId)) return res.status(403).json({ error: 'VA not assigned to this client' });
+
+    // Delete existing client-set schedules for this VA, then insert new
+    await pgQuery('DELETE FROM schedules WHERE user_id=$1 AND client_set=true', [req.params.vaId]);
+    for (const s of schedules) {
+      await pgQuery(
+        `INSERT INTO schedules (user_id, days_mask, start_time, end_time, client_set)
+         VALUES ($1, $2::jsonb, $3, $4, true)`,
+        [req.params.vaId, JSON.stringify(s.days), s.start, s.end]
+      );
+    }
+
+    rosterCache = null; // Invalidate so next read picks up new schedules
+    await logEdit(clientId, 'Client', 'schedule-set', req.params.vaId, null, { schedules });
+    res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
